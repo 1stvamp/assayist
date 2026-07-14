@@ -10,8 +10,9 @@
 //
 // Host prep applies with `run --apply-prep` (writes governor/SMT/THP via
 // `apply_tuning` and refuses the run if readback != requested); without it `run`
-// observes the host read-only. Runs grade at most `valid` until per-run
-// `pinning_layout` is recorded (see TODO.md).
+// observes the host read-only. With `host_prep.pin_threads` the firecracker
+// target pins vCPU threads and records the per-run `pinning_layout`, so a
+// fully-prepped, pinned run on an extended-fact host can grade `reproducible`.
 
 mod adapter;
 mod capture;
@@ -31,9 +32,10 @@ use def::BenchmarkDef;
 
 /// Pick a target adapter by name. `firecracker` is the native adapter; anything
 /// else falls back to the command adapter (shell templates from the def).
-fn select_target(def: &BenchmarkDef, vars: BTreeMap<String, String>) -> Box<dyn Target> {
+/// `pin_threads` comes from `host_prep`; only the native target acts on it.
+fn select_target(def: &BenchmarkDef, vars: BTreeMap<String, String>, pin_threads: bool) -> Box<dyn Target> {
     match def.target.adapter.as_str() {
-        "firecracker" => Box::new(native::firecracker_target(&def.target.config, &vars)),
+        "firecracker" => Box::new(native::firecracker_target(&def.target.config, &vars, pin_threads)),
         _ => Box::new(adapter::command_target(def, vars)),
     }
 }
@@ -582,7 +584,7 @@ fn run_cmd(args: &[String]) -> ExitCode {
         for (ci, cell) in cells.iter().enumerate() {
             for i in 0..ra.repeat {
                 let vars = adapter::vars(&cell.params, sut);
-                let target = select_target(&def, vars.clone());
+                let target = select_target(&def, vars.clone(), prep.pin_threads);
                 let workload = select_workload(&def, vars);
 
                 let work_dir = ra.out_dir.join("frags").join(format!("{group}-{ci}-{i}"));
@@ -622,10 +624,17 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     &versions,
                 );
                 let gate_ctx = run::build_gate_context(&def, "");
+                // Per-run fingerprint: the tuning/facts are shared, but the
+                // thread-pinning layout is this run's own, so a fully-prepped and
+                // pinned run can grade `reproducible`.
+                let mut fp = fingerprint.clone();
+                if let Some(layout) = target.pinning_layout() {
+                    fp.pinning_layout = Some(layout);
+                }
                 let mut assay = run::assemble(
                     run::new_run_id(),
                     identity,
-                    fingerprint.clone(),
+                    fp,
                     gate_ctx,
                     &art.fragments,
                     art.spans,

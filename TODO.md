@@ -5,13 +5,17 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 
 ## Deferred scope (orchestrator stages 4-5)
 
-- [ ] **`pinning_layout` is never recorded, so runs cannot reach `reproducible`.**
-  `apply_tuning` (governor/SMT/THP) is done and wired behind `assayist run
-  --apply-prep` (verified against real sysfs in an Incus VM: THP applies and the
-  run proceeds; a governor request on a host with no cpufreq is refused). But
-  `has_extended()` also needs `pinning_layout`, which nothing sets. Thread thread
-  pinning (the `pin_threads` directive) through the target adapter and record the
-  layout so a fully-prepped run can grade `reproducible` rather than `valid`.
+- [x] **`pinning_layout` is recorded when `pin_threads` is set (validated on real
+  firecracker).** The firecracker target pins each vCPU thread to a matching
+  logical CPU (`fc_vcpu <n>` -> CPU `n`, via `taskset`) in `reach_steady` and
+  records the layout; `run` folds it into the per-run fingerprint. Validated in a
+  nested-KVM Incus VM (firecracker v1.16.1, 6.1 guest kernel, 4 host CPUs):
+  confirmed firecracker's threads are named `fc_vcpu 0`/`fc_vcpu 1`, that
+  `taskset` affinity actually took (readback showed vcpu0->CPU0, vcpu1->CPU1),
+  and that a 2-vCPU run graded **`reproducible`** with `pinning_layout`
+  `{"vcpu0":0,"vcpu1":1}`. Still open: the `vcpu n -> cpu n` policy is naive and
+  honestly fails the run when the host lacks CPU `n` (a 1-CPU host cannot pin
+  vcpu1); a NUMA-aware / isolcpus-aware policy is future work.
 - [ ] **Fingerprint is read once and reused across all runs.** `run` builds the
   fingerprint once (apply-or-observe) and clones it into every assembled run. Fine
   while the host is static; re-read per run so prep state that drifts between the A
