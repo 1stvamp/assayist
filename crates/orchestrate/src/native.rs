@@ -174,9 +174,13 @@ impl Target for FirecrackerTarget {
     }
 
     fn provision(&self, sh: &dyn Shell) -> Result<(), String> {
-        // Launch the API server and wait for the socket to appear.
+        // Launch the API server, record its pid, and wait for the socket to
+        // appear. The pid goes to a file so teardown can kill by pid rather than
+        // matching the command line: a `pkill -f -- "--api-sock <sock>"` also
+        // matches the very shell running it and SIGTERMs itself.
         let launch = format!(
-            "rm -f '{sock}'; '{bin}' --api-sock '{sock}' >'{sock}.log' 2>&1 & \
+            "rm -f '{sock}' '{sock}.pid'; '{bin}' --api-sock '{sock}' >'{sock}.log' 2>&1 & \
+             echo $! > '{sock}.pid'; \
              for _ in $(seq 1 100); do [ -S '{sock}' ] && exit 0; sleep 0.05; done; \
              echo 'firecracker api socket did not appear' >&2; exit 1",
             sock = self.sock,
@@ -257,10 +261,13 @@ impl Target for FirecrackerTarget {
     }
 
     fn teardown(&self, sh: &dyn Shell) -> Result<(), String> {
-        // Best effort: kill the API server for this sock, remove the socket.
-        // `rm -f` is last and always succeeds, so a no-match pkill is not fatal.
+        // Best effort: kill the API server by the pid recorded at launch, then
+        // remove the socket/pid/log. `rm -f` is last and always succeeds, so a
+        // stale or missing pid is not fatal. Killing by pid (not by command-line
+        // match) avoids SIGTERMing the shell that runs this very command.
         let cmd = format!(
-            "pkill -f -- \"--api-sock {sock}\"; rm -f '{sock}' '{sock}.log'",
+            "[ -f '{sock}.pid' ] && kill \"$(cat '{sock}.pid')\" 2>/dev/null; \
+             rm -f '{sock}' '{sock}.log' '{sock}.pid'",
             sock = self.sock
         );
         sh.run(&cmd).map(|_| ())
@@ -483,12 +490,16 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_teardown_targets_the_sock() {
+    fn firecracker_teardown_kills_by_pidfile_not_cmdline() {
         let t = firecracker_target(&config(&[("api_sock", json!("/tmp/x.sock"))]), &vars(&[]));
         let sh = FakeShell::new();
         t.teardown(&sh).unwrap();
-        assert!(sh.saw("--api-sock /tmp/x.sock"));
+        // Kills by the recorded pid and cleans up; must NOT match on the
+        // command line (that would SIGTERM the shell running the command).
+        assert!(sh.saw("/tmp/x.sock.pid"));
+        assert!(sh.saw("kill"));
         assert!(sh.saw("rm -f '/tmp/x.sock'"));
+        assert!(!sh.saw("pkill"));
     }
 
     #[test]
