@@ -3,20 +3,6 @@
 Running list of flagged items and deferred scope. Point-in-time; move things
 out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md`.
 
-## Flagged code issues (found while planning the orchestrator)
-
-- [ ] **`compute_grade` self-metrics check is vacuous.** `crates/contract/src/lib.rs`,
-  in `compute_grade`: `self_metrics_ok = !self.has_probes() || !self.self_metrics.is_empty()`,
-  but `has_probes()` is defined as `!self_metrics.is_empty()`, so the expression is
-  `x || !x` and always true. The intended rule ("probes ran but emitted no
-  `self_metrics` => cannot be reproducible") can never fire. A real "did probes run"
-  signal is needed, e.g. a count carried in `capture_meta` or passed into `assemble`,
-  independent of whether `self_metrics` came back.
-
-- [ ] **Gate has a dead no-op.** `crates/gate/src/main.rs`, in `run()`:
-  `.map(|result| { result })` is a leftover from a mode-attach idea and does nothing.
-  Harmless; drop it when next touching the file.
-
 ## Deferred scope (orchestrator stages 4-5)
 
 - [ ] **Host prep is not applied, only observed.** `hostprep::apply_tuning` returns
@@ -39,10 +25,6 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 
 ## Deferred scope (orchestrator stage 3)
 
-- [ ] **Per-gadget cardinality flags not mapped.** `plan_gadgets` passes only
-  `--duration` and `--out`. A bounded capture entry (e.g. the kvm gadget's
-  per-guest mode) should translate to that gadget's flags (`--per-guest`,
-  `--max-keys N`), but the mapping is gadget-specific and not wired yet.
 - [ ] **`run_id` is not a canonical ULID.** `run::new_run_id` returns a 128-bit
   hex string derived from time + pid, unique enough for v0 and maps to an OTLP
   `trace_id`, but it is not lexicographically time-ordered. Switch to a real ULID

@@ -43,12 +43,13 @@ pub fn plan_gadgets(
             .clone()
             .ok_or_else(|| format!("capture '{}' names no gadget binary to run", e.probe))?;
         let out_path = out_dir.join(format!("{}.frag.json", sanitize(&e.probe)));
-        let args = vec![
+        let mut args = vec![
             "--duration".to_string(),
             duration_secs.to_string(),
             "--out".to_string(),
             out_path.to_string_lossy().into_owned(),
         ];
+        args.extend(e.args.iter().cloned());
         plan.push(GadgetInvocation { gadget, probe: e.probe.clone(), args, out_path });
     }
     Ok(plan)
@@ -149,6 +150,7 @@ mod tests {
             cardinality: Cardinality { class: "singleton".into(), key_source: None, max_keys: None },
             attach: None,
             hot_path: false,
+            args: vec![],
         }
     }
 
@@ -161,6 +163,17 @@ mod tests {
         assert!(plan[0].args.contains(&"--duration".to_string()));
         assert!(plan[0].args.contains(&"30".to_string()));
         assert_eq!(plan[0].out_path, Path::new("/tmp/x/kvm_exit.frag.json"));
+    }
+
+    #[test]
+    fn extra_args_are_appended_after_duration_and_out() {
+        let mut e = entry("kvm_exit", Some("assayist-capture-kvm"));
+        e.args = vec!["--per-guest".into(), "--max-keys".into(), "10000".into()];
+        let plan = plan_gadgets(&[e], 30, Path::new("/tmp/x")).unwrap();
+        assert_eq!(
+            plan[0].args,
+            vec!["--duration", "30", "--out", "/tmp/x/kvm_exit.frag.json", "--per-guest", "--max-keys", "10000"]
+        );
     }
 
     #[test]

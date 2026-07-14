@@ -354,6 +354,7 @@ mod tests {
             cardinality: Cardinality { class: "singleton".into(), key_source: None, max_keys: None },
             attach: None,
             hot_path: false,
+            args: vec![],
         }];
         let plan = plan_gadgets(&entries, 1, Path::new("/tmp")).unwrap();
 
