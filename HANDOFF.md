@@ -1,0 +1,105 @@
+# HANDOFF
+
+For a Claude Code session picking up Assayist. Read this, then `CLAUDE.md`, then `docs/architecture.md` and `docs/contract-v0.md`. This file is point-in-time; the docs are durable.
+
+## What Assayist is (30 seconds)
+
+A standardised, low-observer-effect eBPF benchmarking system for VMs, microVMs, unikernels, hypervisors, and eBPF-as-subsystem experiments. It standardises three things around the thing under test: a metric contract, a host/KVM-side eBPF capture plane, and a decision gate. Targets and workloads are pluggable adapters. Grounding for every design choice is in `docs/research-survey.md`.
+
+## Current state
+
+Verified by execution here: the `contract` crate and the `gate` (permutation A/B, longitudinal drift, subsystem triad). Written but not built (need a BTF+KVM Linux host with clang and bpftool): the four capture gadgets. Stub: the orchestrator. Designed only: the OTLP plugin and reference adapters.
+
+| Component | Path | State |
+|---|---|---|
+| Contract spec + JSON Schema | `docs/contract-v0.md`, `contract/assay-run.schema.json` | drafted v0 |
+| Typed producer model + grading | `crates/contract` | built, 4 tests pass |
+| Gate | `crates/gate` | built, 5 tests pass, 6 scenarios verified |
+| KVM gadget (exit-handling latency) | `capture/kvm` | written |
+| Block gadget (per-device IO latency) | `capture/block` | written |
+| Net gadget (tap counters + size hist) | `capture/net` | written |
+| Ctrlplane gadget (runqueue latency, on-CPU) | `capture/ctrlplane` | written |
+| Orchestrator | `crates/orchestrate` | v0 complete: `run` (full A/B pipeline), `capture`, `inspect`. Host-prep apply pending (observe-only), native adapters pending |
+| OTLP import/export plugin | (design in contract-v0.md) | not built |
+| Reference target/workload adapters | `adapters/` | empty |
+
+## Build and verify
+
+```
+cargo build --release            # core: contract, gate, orchestrate
+cargo test                       # 9 tests, must stay green
+bash scripts/verify-gate.sh      # rebuilds gate, checks all 6 gate scenarios
+```
+
+Gadgets, per BTF host:
+```
+cd capture/kvm
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/bpf/vmlinux.h
+cargo build --release
+```
+
+Toolchain: builds on stable Rust (verified on 1.75). The gate depends only on `serde_json`; the contract crate adds `serde`.
+
+## The orchestrator (v0): done
+
+`assayist run bench.yaml` works. Built in `crates/orchestrate` on the `assayist-contract` crate (`AssayRun::assemble`, `Fragment`, grading). Three subcommands:
+
+- `assayist run <def.yaml> [--repeat N] [--a-sut SHA] [--b-sut SHA] [--out DIR] [--duration N] [--allow-ungraded]` runs the full A/B pipeline: for each parameterisation cell, N repeats per group, capture, assemble a graded `AssayRun`, then shell out to `assayist-gate` and propagate its exit code (0 pass, 1 error, 2 fail, 3 contaminated).
+- `assayist capture <def.yaml> [...]` fires the gadgets once and assembles one run.
+- `assayist inspect <def.yaml>` is the read-only parse/validate/expand + host observation.
+
+Module map:
+- `def.rs` parse/validate/expand, `benchmark_def_sha`, per-cell `params_hash`. Load-rejects missing cardinality, unbounded, bounded-without-key, unknown gate mode/tenancy, uprobe-on-hot-path.
+- `hostprep.rs` `Fingerprint` behind a `Host` trait (`LinuxHost` reads `/proc`+`/sys`, fake for tests); requested-vs-readback tuning rule. `apply_tuning`/`prepare` exist but are unimplemented (needs root); `run` uses `observe()` for now, so runs grade at most `valid`.
+- `capture.rs` `GadgetRunner` spawn/wait seam; `capture()` spawns all then waits all so gadgets share one window; `SubprocessRunner` real, fake for tests.
+- `adapter.rs` the SPI: `Target` (provision/start/reach_steady/spans/teardown) and `Workload` (start/stop/report) traits, a v0 command-adapter that runs shell templates from the def with `{param}` interpolation, and `execute_run` (spawn gadgets, run workload across the window, wait, wind down). `Shell` seam for tests.
+- `run.rs` builds `Identity` + gate context, calls `AssayRun::assemble`, mints run ids.
+- `gate.rs` resolves and invokes `assayist-gate`, parses the outcome.
+
+Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub gadget + no-op command adapters) and a manual multi-cell run. Load-time rejections and cross-tenancy refusal are covered. What is NOT done is in `TODO.md`: host-prep apply (so `reproducible` grade is unreachable until then), native `firecracker`/`fio` adapters, and where the workload report lands.
+
+## After the orchestrator
+
+1. OTLP import/export plugin (design in `docs/contract-v0.md`): export is a rote transform (run_id -> trace_id, log2 -> exponential scale 0, fingerprint -> resource attrs); import degrades to `grade: valid`.
+2. Reference adapters: `firecracker` target (boot/snapshot/restore spans), `fio` and `wrk` workloads.
+3. Finer histograms for tail gating: log2-derived p50/p99 are too coarse to gate on (see gate README); add an explicit/high-resolution histogram option for metrics whose tail you need to gate.
+4. Optional: refactor the gate to read via the `contract` crate types where it helps, but keep it liberal in what it accepts.
+
+## Decisions log (the non-obvious calls and why)
+
+- Host/KVM-side vantage is the whole reason one system spans everything: it observes any guest agentlessly. Do not add in-guest agents to the core.
+- Aggregate in-kernel into histograms; never stream per-event. This is the observer-effect story (netstacklat ~0.75% CPU vs ~1 us/event).
+- Contract is native, not OTLP, with an OTLP plugin. Three concepts (fingerprint, cardinality budget, self-metrics) have no OTLP equivalent and enforce the guarantees, so they stay native.
+- Producer strict, consumer liberal: contract crate + orchestrator strict, gate liberal.
+- Gadgets excluded from the workspace: they need a BTF host and are invoked as subprocesses, not linked.
+- KVM gadget uses classic `tracepoint` not `tp_btf`, because reading `exit_reason` at tp_btf speed is arch/version-fragile (VMX vs SVM). Added `tracepoint` to the attach_kind enum for this.
+- Block gadget keys by device, not guest: completion runs in softirq context where the current task is not the guest, so cgroup-at-completion would be a confident wrong number. Per-guest block needs syscall-level VMM tracing, a separate gadget.
+- Ctrlplane gadget does not uprobe Go internals: banned on hot paths, unsafe on Go. It captures host scheduler treatment (runqueue latency, on-CPU); app-level scheduling/reconcile latency comes via OTLP import.
+- Gate noise metric is within-group CoV, not pooled: pooling folds a real regression into the spread and hides it. (This was a bug found by running it.)
+- Gate polarity is unit-first: a time-unit metric is lower-better by default; name tokens only carry throughput and CPU-ambiguity cases. (Also found by running it: name-token polarity missed `restore.resume_to_steady`.)
+
+## Gotchas (things that will bite)
+
+- Sample-count sets a p-value floor: N-vs-N runs can only reach p ~ 2/C(2N,N). At 4-vs-4 that is ~0.029, so p<0.01 is unreachable. Budget enough repeats; the gate is honest, not broken, when it will not call a small-sample regression.
+- log2-derived p50/p99 are coarse (snap to bucket midpoints), so the noise gate usually excludes them. Gate on the mean (from the exact `sum` the gadgets emit); use finer histograms if you must gate a tail.
+- Gadget userspace targets libbpf-rs 0.24; the prog-info call uses libbpf-sys directly. Expect minor API drift on other point releases. The tc-attach path in the net gadget is the most version-sensitive bit.
+- `name_to_handle_at` cgroup-id resolution (ctrlplane) assumes cgroup v2 kernfs handles; `--cgroup-id` is the escape hatch.
+- The two LICENSE files hold TODO placeholders for canonical text. Fill before publishing.
+- Contract enum additions so far (all additive on v0): `attach_kind` gained `tracepoint` and `tc`; `key_source` gained `device` and `netdev`. Keep additions additive.
+
+## File map
+
+- `README.md` project overview and status
+- `TODO.md` running list of flagged items and deferred scope
+- `CLAUDE.md` conventions for the agent (read this)
+- `docs/contract-v0.md` the normative contract spec
+- `docs/architecture.md` the design brief (spine plus adapters, coverage matrix)
+- `docs/research-survey.md` the evidence behind the design
+- `docs/compatibility-matrix.md` per-kernel gadget field/tracepoint deps
+- `contract/assay-run.schema.json` machine-checkable contract
+- `crates/contract` typed producer model + grading (built, tested)
+- `crates/gate` the decision engine (built, tested; see its README for decision rules)
+- `crates/orchestrate` the orchestrator (v0 built: def/hostprep/capture/adapter/run/gate; `run`/`capture`/`inspect` subcommands; `tests/pipeline.rs` end-to-end)
+- `capture/{kvm,block,net,ctrlplane}` the eBPF gadgets (each has a README with limits)
+- `scripts/verify-gate.sh` reproduces the gate scenario suite
+- `examples/firecracker-boot-snapshot.assay.yaml` a benchmark def
