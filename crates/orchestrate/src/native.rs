@@ -100,12 +100,16 @@ pub struct FirecrackerTarget {
     /// (snapshot_path, mem_file): snapshot the running VM at steady state.
     snapshot_out: Option<(String, String)>,
     readiness: Option<String>,
+    /// Pin each vCPU thread to a dedicated logical CPU and record the layout.
+    pin_threads: bool,
     spans: RefCell<Vec<Value>>,
+    pinning: RefCell<Option<Value>>,
 }
 
 pub fn firecracker_target(
     config: &BTreeMap<String, Value>,
     vars: &BTreeMap<String, String>,
+    pin_threads: bool,
 ) -> FirecrackerTarget {
     let g = |k: &str, d: &str| cfg(config, vars, k, d);
     // vcpu/mem come from the parameterisation cell when present.
@@ -136,7 +140,9 @@ pub fn firecracker_target(
         from_snapshot,
         snapshot_out,
         readiness,
+        pin_threads,
         spans: RefCell::new(Vec::new()),
+        pinning: RefCell::new(None),
     }
 }
 
@@ -162,6 +168,27 @@ impl FirecrackerTarget {
         let end = now_nanos();
         self.spans.borrow_mut().push(span(name, parent, start, end));
         Ok(())
+    }
+
+    /// Shell that pins each firecracker vCPU thread to a matching logical CPU
+    /// (`fc_vcpu <n>` -> CPU `n`) via `taskset` and prints the applied layout as
+    /// JSON on stdout. It reads the pid recorded at launch, so it must run after
+    /// the VM has started (threads exist). A vcpu whose `taskset` fails aborts
+    /// the run: a run that asked to pin and could not must not claim it did.
+    fn pin_cmd(&self) -> String {
+        format!(
+            "pid=$(cat '{sock}.pid'); layout=''; \
+             for t in /proc/$pid/task/*; do \
+               comm=$(cat \"$t/comm\" 2>/dev/null); \
+               case \"$comm\" in \"fc_vcpu \"*) \
+                 n=${{comm#fc_vcpu }}; tid=${{t##*/}}; \
+                 taskset -pc \"$n\" \"$tid\" >/dev/null 2>&1 || {{ echo \"pin vcpu $n failed\" >&2; exit 7; }}; \
+                 layout=\"$layout,\\\"vcpu$n\\\":$n\"; \
+               ;; esac; \
+             done; \
+             printf '{{%s}}' \"${{layout#,}}\"",
+            sock = self.sock,
+        )
     }
 }
 
@@ -239,6 +266,17 @@ impl Target for FirecrackerTarget {
                 sh.run(cmd)?;
             }
         }
+        // Pin vCPU threads once they exist (post start/resume) and record the
+        // layout so a fully-prepped run can grade `reproducible`.
+        if self.pin_threads {
+            let out = sh.run(&self.pin_cmd())?;
+            let layout: Value = serde_json::from_str(out.trim())
+                .map_err(|e| format!("parsing pinning layout '{}': {e}", out.trim()))?;
+            match layout.as_object() {
+                Some(m) if !m.is_empty() => *self.pinning.borrow_mut() = Some(layout),
+                _ => return Err("pin_threads requested but no fc_vcpu threads were pinned".into()),
+            }
+        }
         // Snapshot the steady-state VM if asked.
         if let Some((snap, mem)) = &self.snapshot_out {
             self.api(sh, "PATCH", "/vm", r#"{"state":"Paused"}"#)?;
@@ -271,6 +309,10 @@ impl Target for FirecrackerTarget {
             sock = self.sock
         );
         sh.run(&cmd).map(|_| ())
+    }
+
+    fn pinning_layout(&self) -> Option<Value> {
+        self.pinning.borrow().clone()
     }
 }
 
@@ -420,7 +462,7 @@ mod tests {
             ("kernel", json!("/k/vmlinux")),
             ("rootfs", json!("/k/rootfs.ext4")),
         ]);
-        let t = firecracker_target(&cfg, &vars(&[("vcpu", "2"), ("mem_mib", "512")]));
+        let t = firecracker_target(&cfg, &vars(&[("vcpu", "2"), ("mem_mib", "512")]), false);
         let sh = FakeShell::new();
 
         t.provision(&sh).unwrap();
@@ -448,7 +490,7 @@ mod tests {
             ("from_snapshot", json!("/s/snap")),
             ("mem_file", json!("/s/mem")),
         ]);
-        let t = firecracker_target(&cfg, &vars(&[]));
+        let t = firecracker_target(&cfg, &vars(&[]), false);
         let sh = FakeShell::new();
 
         t.provision(&sh).unwrap();
@@ -472,7 +514,7 @@ mod tests {
             ("snapshot_out", json!("/s/snap")),
             ("snapshot_mem", json!("/s/mem")),
         ]);
-        let t = firecracker_target(&cfg, &vars(&[]));
+        let t = firecracker_target(&cfg, &vars(&[]), false);
         let sh = FakeShell::new();
 
         t.provision(&sh).unwrap();
@@ -490,8 +532,53 @@ mod tests {
     }
 
     #[test]
+    fn firecracker_pins_vcpu_threads_and_records_layout() {
+        let cfg = config(&[
+            ("kernel", json!("/k/vmlinux")),
+            ("rootfs", json!("/k/rootfs.ext4")),
+            ("api_sock", json!("/tmp/p.sock")),
+        ]);
+        let t = firecracker_target(&cfg, &vars(&[("vcpu", "2")]), true);
+        // The pin command reads the launch pidfile and tasksets threads; the
+        // fake returns the layout it "applied".
+        let sh = FakeShell::new().reply("taskset", r#"{"vcpu0":0,"vcpu1":1}"#);
+
+        t.provision(&sh).unwrap();
+        t.start(&sh).unwrap();
+        t.reach_steady(&sh).unwrap();
+
+        assert!(sh.saw("taskset"));
+        assert!(sh.saw("/tmp/p.sock.pid"));
+        assert!(sh.saw("fc_vcpu"));
+        assert_eq!(t.pinning_layout(), Some(json!({"vcpu0": 0, "vcpu1": 1})));
+    }
+
+    #[test]
+    fn firecracker_no_pin_records_no_layout() {
+        let cfg = config(&[("kernel", json!("/k/v")), ("rootfs", json!("/k/r"))]);
+        let t = firecracker_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        t.start(&sh).unwrap();
+        t.reach_steady(&sh).unwrap();
+        assert!(!sh.saw("taskset"));
+        assert_eq!(t.pinning_layout(), None);
+    }
+
+    #[test]
+    fn firecracker_pin_with_no_vcpu_threads_errors() {
+        let cfg = config(&[("kernel", json!("/k/v")), ("rootfs", json!("/k/r"))]);
+        let t = firecracker_target(&cfg, &vars(&[]), true);
+        // No vcpu threads found -> pin command prints an empty object.
+        let sh = FakeShell::new().reply("taskset", "{}");
+        t.provision(&sh).unwrap();
+        t.start(&sh).unwrap();
+        assert!(t.reach_steady(&sh).is_err());
+    }
+
+    #[test]
     fn firecracker_teardown_kills_by_pidfile_not_cmdline() {
-        let t = firecracker_target(&config(&[("api_sock", json!("/tmp/x.sock"))]), &vars(&[]));
+        let t = firecracker_target(&config(&[("api_sock", json!("/tmp/x.sock"))]), &vars(&[]), false);
         let sh = FakeShell::new();
         t.teardown(&sh).unwrap();
         // Kills by the recorded pid and cleans up; must NOT match on the

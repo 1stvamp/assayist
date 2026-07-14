@@ -53,6 +53,13 @@ pub trait Target {
     /// Lifecycle spans the target recorded (boot/snapshot/restore markers).
     fn spans(&self, sh: &dyn Shell) -> Result<Vec<Value>, String>;
     fn teardown(&self, sh: &dyn Shell) -> Result<(), String>;
+    /// The thread-pinning layout the target applied this run, if any (e.g.
+    /// `{"vcpu0": 0, "vcpu1": 1}`). Recorded into the per-run fingerprint; a
+    /// `None` leaves the run un-pinned, so it can grade at most `valid`. Default
+    /// is `None` for targets that do not pin.
+    fn pinning_layout(&self) -> Option<Value> {
+        None
+    }
 }
 
 pub trait Workload {
