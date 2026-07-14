@@ -11,10 +11,6 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
   not already match, runs grade `invalid` (honest: prep did not take). Implement
   the sysfs writes with the appropriate root/guard handling, then switch `run` to
   `prepare()` and record `pinning_layout` so runs can reach `reproducible`.
-- [ ] **`workload_report` is captured but not stored.** `execute_run` collects the
-  workload driver's `report` output and the pipeline logs it, but the contract has
-  no field for it, so it is dropped from the `AssayRun`. Decide where it belongs
-  (a span attribute, a new optional field) or keep it out deliberately.
 - [ ] **Fingerprint is read once and reused across all runs.** `run` observes the
   host once and clones the fingerprint into every assembled run. Fine while the
   host is static, but re-read per run once prep-apply lands (prep state can differ

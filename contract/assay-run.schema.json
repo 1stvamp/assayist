@@ -37,7 +37,10 @@
       "items": { "$ref": "#/$defs/ProbeCost" }
     },
     "gate": { "$ref": "#/$defs/GateContext" },
-    "outcome": { "$ref": "#/$defs/Outcome" }
+    "outcome": { "$ref": "#/$defs/Outcome" },
+    "workload_report": {
+      "description": "Opaque workload-driver report (provenance only; does not affect grading or gating)."
+    }
   },
   "$defs": {
     "Scalar": {

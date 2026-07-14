@@ -85,7 +85,7 @@ Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub g
 - Gadget userspace targets libbpf-rs 0.24; the prog-info call uses libbpf-sys directly. Expect minor API drift on other point releases. The tc-attach path in the net gadget is the most version-sensitive bit.
 - `name_to_handle_at` cgroup-id resolution (ctrlplane) assumes cgroup v2 kernfs handles; `--cgroup-id` is the escape hatch.
 - The two LICENSE files hold TODO placeholders for canonical text. Fill before publishing.
-- Contract enum additions so far (all additive on v0): `attach_kind` gained `tracepoint` and `tc`; `key_source` gained `device` and `netdev`. Keep additions additive.
+- Contract additions so far (all additive on v0): `attach_kind` gained `tracepoint` and `tc`; `key_source` gained `device` and `netdev`; `AssayRun` gained an optional `workload_report` (opaque provenance, no grading/gating effect). Keep additions additive.
 
 ## File map
 

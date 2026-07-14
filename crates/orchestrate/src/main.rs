@@ -578,7 +578,7 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     &versions,
                 );
                 let gate_ctx = run::build_gate_context(&def, "");
-                let assay = run::assemble(
+                let mut assay = run::assemble(
                     run::new_run_id(),
                     identity,
                     fingerprint.clone(),
@@ -586,6 +586,9 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     &art.fragments,
                     art.spans,
                 );
+                if !art.workload_report.is_null() {
+                    assay.workload_report = Some(art.workload_report);
+                }
 
                 let path = ra.out_dir.join(format!("{group}_{ci}_{i}.json"));
                 let json = match serde_json::to_string_pretty(&assay) {

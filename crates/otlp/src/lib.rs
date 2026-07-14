@@ -453,6 +453,7 @@ pub fn import(doc: &Value) -> Result<AssayRun, String> {
         self_metrics: vec![], // never reconstructed on import
         gate: json!({}),
         outcome: None,
+        workload_report: None,
         grade: Grade::Invalid,
     };
     // Imported source -> Valid (compute_grade short-circuits on source).

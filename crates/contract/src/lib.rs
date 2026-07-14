@@ -101,6 +101,10 @@ pub struct AssayRun {
     pub gate: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Value>,
+    /// Opaque workload-driver report (e.g. fio's JSON output). Provenance only:
+    /// it does not affect grading or gating. Additive optional field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_report: Option<Value>,
     pub grade: Grade,
 }
 
@@ -149,6 +153,7 @@ impl AssayRun {
             self_metrics,
             gate,
             outcome: None,
+            workload_report: None,
             grade: Grade::Invalid,
         };
         run.grade = run.compute_grade(probes_ran);
@@ -260,6 +265,19 @@ mod tests {
         };
         let run = AssayRun::assemble("01".into(), id(), fp(true, true), json!({}), &[frag], vec![]);
         assert_eq!(run.grade, Grade::Reproducible);
+    }
+
+    #[test]
+    fn workload_report_defaults_none_and_round_trips() {
+        let mut run = AssayRun::assemble("01".into(), id(), fp(true, true), json!({}), &[], vec![]);
+        // Defaults to None and is omitted from JSON when absent.
+        assert!(run.workload_report.is_none());
+        assert!(!serde_json::to_string(&run).unwrap().contains("workload_report"));
+        // When set, it round-trips.
+        run.workload_report = Some(json!({"fio": {"iops": 1234}}));
+        let text = serde_json::to_string(&run).unwrap();
+        let back: AssayRun = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.workload_report, Some(json!({"fio": {"iops": 1234}})));
     }
 
     #[test]
