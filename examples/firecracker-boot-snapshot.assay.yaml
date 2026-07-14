@@ -5,8 +5,22 @@ name: firecracker-boot-snapshot
 target:
   adapter: firecracker
   version: ">=0.3"
+  # Native firecracker adapter settings. vcpu/mem_mib come from the cell; the
+  # rest configure the microVM. Set from_snapshot+mem_file for restore-mode runs.
+  config:
+    bin: firecracker
+    kernel: /var/lib/assayist/vmlinux
+    rootfs: /var/lib/assayist/rootfs.ext4
+    boot_args: "console=ttyS0 reboot=k panic=1"
 workload:
   driver: fio-libaio
+  # Native fio adapter settings. Values may reference cell params as {name}.
+  config:
+    filename: /dev/vdb
+    rw: randread
+    bs: 4k
+    iodepth: 32
+    runtime: 30
 gate:
   mode: ab_permutation
   p_threshold: 0.01

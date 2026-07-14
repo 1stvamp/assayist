@@ -8,22 +8,46 @@
 //   capture single capture: fire the gadgets once and assemble one graded run.
 //   inspect read-only: parse/validate/expand a def and observe the host.
 //
-// Host prep is not applied yet (the mutating `apply_tuning` path is unimplemented,
-// see TODO.md), so `run` observes the host read-only; runs grade at most `valid`
-// until prep-apply and per-run pinning land.
+// Host prep applies with `run --apply-prep` (writes governor/SMT/THP via
+// `apply_tuning` and refuses the run if readback != requested); without it `run`
+// observes the host read-only. Runs grade at most `valid` until per-run
+// `pinning_layout` is recorded (see TODO.md).
 
 mod adapter;
 mod capture;
 mod def;
 mod gate;
 mod hostprep;
+mod native;
 mod run;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use adapter::{Target, Workload};
 use assayist_contract::Grade;
+use def::BenchmarkDef;
+
+/// Pick a target adapter by name. `firecracker` is the native adapter; anything
+/// else falls back to the command adapter (shell templates from the def).
+fn select_target(def: &BenchmarkDef, vars: BTreeMap<String, String>) -> Box<dyn Target> {
+    match def.target.adapter.as_str() {
+        "firecracker" => Box::new(native::firecracker_target(&def.target.config, &vars)),
+        _ => Box::new(adapter::command_target(def, vars)),
+    }
+}
+
+/// Pick a workload driver by name. `fio` / `fio-*` is the native adapter;
+/// anything else falls back to the command adapter.
+fn select_workload(def: &BenchmarkDef, vars: BTreeMap<String, String>) -> Box<dyn Workload> {
+    match def.workload.driver.as_str() {
+        d if d == "fio" || d.starts_with("fio-") => {
+            Box::new(native::fio_workload(&def.workload.config, &vars))
+        }
+        _ => Box::new(adapter::command_workload(def, vars)),
+    }
+}
 
 fn usage() -> ExitCode {
     eprintln!("usage:");
@@ -558,8 +582,8 @@ fn run_cmd(args: &[String]) -> ExitCode {
         for (ci, cell) in cells.iter().enumerate() {
             for i in 0..ra.repeat {
                 let vars = adapter::vars(&cell.params, sut);
-                let target = adapter::command_target(&def, vars.clone());
-                let workload = adapter::command_workload(&def, vars);
+                let target = select_target(&def, vars.clone());
+                let workload = select_workload(&def, vars);
 
                 let work_dir = ra.out_dir.join("frags").join(format!("{group}-{ci}-{i}"));
                 if let Err(e) = std::fs::create_dir_all(&work_dir) {
@@ -574,7 +598,7 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     }
                 };
 
-                let art = match adapter::execute_run(&shell, &runner, &target, &workload, &plan) {
+                let art = match adapter::execute_run(&shell, &runner, target.as_ref(), workload.as_ref(), &plan) {
                     Ok(a) => a,
                     Err(e) => {
                         eprintln!("run {group}[cell {ci} #{i}] failed: {e}");

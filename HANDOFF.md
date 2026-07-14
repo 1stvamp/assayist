@@ -21,7 +21,7 @@ Verified by execution here: the `contract` crate and the `gate` (permutation A/B
 | Ctrlplane gadget (runqueue latency, on-CPU) | `capture/ctrlplane` | written |
 | Orchestrator | `crates/orchestrate` | v0 complete: `run` (A/B pipeline, `--apply-prep` writes host tuning), `capture`, `inspect`, `export`/`import`. `pinning_layout` + native adapters pending |
 | OTLP export + import | `crates/otlp` | built, tested (round-trip); wired as `assayist export` / `assayist import` |
-| Reference target/workload adapters | `adapters/` | empty |
+| Native firecracker target + fio workload | `crates/orchestrate/src/native.rs` | built, unit-tested vs fake shell; unexercised on a real KVM host |
 
 ## Build and verify
 
@@ -52,7 +52,8 @@ Module map:
 - `def.rs` parse/validate/expand, `benchmark_def_sha`, per-cell `params_hash`. Load-rejects missing cardinality, unbounded, bounded-without-key, unknown gate mode/tenancy, uprobe-on-hot-path.
 - `hostprep.rs` `Fingerprint` behind a `Host` trait (`LinuxHost` reads `/proc`+`/sys`, fake for tests); requested-vs-readback tuning rule. `apply_tuning` writes governor/SMT/THP to sysfs; `assayist run --apply-prep` applies (needs root) and refuses the run if readback != requested, else observes read-only. Verified against real sysfs in an Incus VM. Runs grade at most `valid` until `pinning_layout` is recorded (see TODO.md).
 - `capture.rs` `GadgetRunner` spawn/wait seam; `capture()` spawns all then waits all so gadgets share one window; `SubprocessRunner` real, fake for tests.
-- `adapter.rs` the SPI: `Target` (provision/start/reach_steady/spans/teardown) and `Workload` (start/stop/report) traits, a v0 command-adapter that runs shell templates from the def with `{param}` interpolation, and `execute_run` (spawn gadgets, run workload across the window, wait, wind down). `Shell` seam for tests.
+- `adapter.rs` the SPI: `Target` (provision/start/reach_steady/spans/teardown) and `Workload` (start/stop/report) traits, a command-adapter that runs shell templates from the def with `{param}` interpolation, and `execute_run` (spawn gadgets, run workload across the window, wait, wind down). `Shell` seam for tests.
+- `native.rs` the reference adapters: `firecracker` target and `fio` workload, both driving their tool through `Shell` (curl over the api-sock; fio CLI). `main.rs` dispatches on `target.adapter`/`workload.driver`; unknown names fall back to the command adapter.
 - `run.rs` builds `Identity` + gate context, calls `AssayRun::assemble`, mints run ids.
 - `gate.rs` resolves and invokes `assayist-gate`, parses the outcome.
 
@@ -61,7 +62,7 @@ Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub g
 ## After the orchestrator
 
 1. ~~OTLP export + import~~ done (`crates/otlp`, `assayist export` / `assayist import`). Export: run_id -> trace_id, spans with deterministic ids, log2 -> exponential scale 0, explicit -> histogram, counter -> sum, gauge -> gauge, self_metrics -> `assayist.probe.*`, fingerprint/identity -> resource attrs (semconv where it exists). Import degrades gracefully: fills spans + series + fingerprint core, no self_metrics, `identity.source = imported`, `grade: valid`. Round-trip tested.
-2. Reference adapters: `firecracker` target (boot/snapshot/restore spans), `fio` and `wrk` workloads.
+2. ~~Reference adapters: `firecracker` target (boot/snapshot/restore spans), `fio` workload.~~ built in `crates/orchestrate/src/native.rs`, selected by `target.adapter: firecracker` / `workload.driver: fio*`; settings in the def's `target.config` / `workload.config`. Unexercised on a real KVM host (see TODO.md). A `wrk` workload is still open.
 3. Finer histograms for tail gating: log2-derived p50/p99 are too coarse to gate on (see gate README); add an explicit/high-resolution histogram option for metrics whose tail you need to gate.
 4. Optional: refactor the gate to read via the `contract` crate types where it helps, but keep it liberal in what it accepts.
 

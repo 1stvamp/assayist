@@ -35,7 +35,7 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | written, needs a BTF host |
 | OTLP export + import (`crates/otlp`) | built, tested; wired as `assayist export` / `import` |
 | `crates/orchestrate` (run defs -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export` |
-| reference target/workload adapters | not yet started |
+| reference adapters: `firecracker` target + `fio` workload (`crates/orchestrate/src/native.rs`) | built, unit-tested; unexercised on a real KVM host |
 
 The gate is the only piece verified by execution here; the gadgets are written to be correct but need a BTF-enabled Linux host with clang and bpftool to build and run.
 
