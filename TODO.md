@@ -5,16 +5,17 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 
 ## Deferred scope (orchestrator stages 4-5)
 
-- [ ] **Host prep is not applied, only observed.** `hostprep::apply_tuning` returns
-  an error (writing sysfs needs root), so `assayist run` uses `observe()`. Runs
-  grade at most `valid`, and if a def's `host_prep` requests tuning the host does
-  not already match, runs grade `invalid` (honest: prep did not take). Implement
-  the sysfs writes with the appropriate root/guard handling, then switch `run` to
-  `prepare()` and record `pinning_layout` so runs can reach `reproducible`.
-- [ ] **Fingerprint is read once and reused across all runs.** `run` observes the
-  host once and clones the fingerprint into every assembled run. Fine while the
-  host is static, but re-read per run once prep-apply lands (prep state can differ
-  between the A and B SUT builds).
+- [ ] **`pinning_layout` is never recorded, so runs cannot reach `reproducible`.**
+  `apply_tuning` (governor/SMT/THP) is done and wired behind `assayist run
+  --apply-prep` (verified against real sysfs in an Incus VM: THP applies and the
+  run proceeds; a governor request on a host with no cpufreq is refused). But
+  `has_extended()` also needs `pinning_layout`, which nothing sets. Thread thread
+  pinning (the `pin_threads` directive) through the target adapter and record the
+  layout so a fully-prepped run can grade `reproducible` rather than `valid`.
+- [ ] **Fingerprint is read once and reused across all runs.** `run` builds the
+  fingerprint once (apply-or-observe) and clones it into every assembled run. Fine
+  while the host is static; re-read per run so prep state that drifts between the A
+  and B SUT builds is caught.
 - [ ] **Command adapters are the only adapter.** The `Target`/`Workload` traits are
   the SPI; only the shell command-adapter implements them. Real `firecracker`/`fio`
   adapters (native Rust, with genuine lifecycle spans and versions) come next.

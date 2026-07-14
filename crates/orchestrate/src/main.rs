@@ -27,8 +27,9 @@ use assayist_contract::Grade;
 
 fn usage() -> ExitCode {
     eprintln!("usage:");
-    eprintln!("  assayist run <def.yaml> [--repeat N] [--a-sut SHA] [--b-sut SHA] [--out DIR] [--duration N] [--allow-ungraded]");
+    eprintln!("  assayist run <def.yaml> [--repeat N] [--a-sut SHA] [--b-sut SHA] [--out DIR] [--duration N] [--allow-ungraded] [--apply-prep]");
     eprintln!("      full A/B pipeline: capture N runs per group per cell, assemble, and gate.");
+    eprintln!("      --apply-prep writes host tuning to sysfs (needs root); default observes read-only.");
     eprintln!("  assayist capture <def.yaml> [--duration N] [--out PATH] [--sut-sha SHA] [--work-dir DIR]");
     eprintln!("      fire the def's capture gadgets once and assemble one graded AssayRun.");
     eprintln!("  assayist inspect <def.yaml>");
@@ -449,6 +450,7 @@ struct RunArgs {
     out_dir: PathBuf,
     duration: u64,
     allow_ungraded: bool,
+    apply_prep: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -461,6 +463,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         out_dir: PathBuf::from("assayist-out"),
         duration: 30,
         allow_ungraded: false,
+        apply_prep: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -476,6 +479,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--out" => ra.out_dir = PathBuf::from(next()?),
             "--duration" => ra.duration = next()?.parse().map_err(|_| "bad --duration")?,
             "--allow-ungraded" => ra.allow_ungraded = true,
+            "--apply-prep" => ra.apply_prep = true,
             other if other.starts_with("--") => return Err(format!("unknown flag {other}")),
             other => {
                 if def_path.is_some() {
@@ -509,19 +513,35 @@ fn run_cmd(args: &[String]) -> ExitCode {
 
     let cells = def::expand_cells(&def);
     let prep = hostprep::HostPrep::from_value(&def.host_prep);
-    if prep.knobs.to_value() != serde_json::json!({}) {
+    let host = hostprep::LinuxHost::new();
+    let has_knobs = prep.knobs.to_value() != serde_json::json!({});
+    if has_knobs && !ra.apply_prep {
         eprintln!(
-            "note: host prep is not applied yet (observe-only). requested tuning {} is recorded but not enforced, so runs may grade `invalid` if the host does not already match. see TODO.md.",
+            "note: --apply-prep not set, so host prep is observed not applied. requested tuning {} is recorded but not enforced; runs grade `invalid` if the host does not already match.",
             prep.knobs.to_value()
         );
     }
-    let fingerprint = match hostprep::observe(&hostprep::LinuxHost::new(), &prep, &def.tenancy) {
+    // Apply host prep (mutates sysfs, needs root) only when asked; otherwise
+    // observe the current state read-only.
+    let fp_result = if ra.apply_prep {
+        hostprep::prepare(&host, &prep, &def.tenancy)
+    } else {
+        hostprep::observe(&host, &prep, &def.tenancy)
+    };
+    let fingerprint = match fp_result {
         Ok(fp) => fp,
         Err(e) => {
             eprintln!("cannot build fingerprint: {e}");
             return ExitCode::from(1);
         }
     };
+    if ra.apply_prep && !fingerprint.tuning_consistent() {
+        eprintln!(
+            "host prep did not take: requested {} but host reports {}. refusing the run.",
+            fingerprint.tuning_requested, fingerprint.tuning_readback
+        );
+        return ExitCode::from(1);
+    }
 
     if let Err(e) = std::fs::create_dir_all(&ra.out_dir) {
         eprintln!("creating out dir {}: {e}", ra.out_dir.display());
