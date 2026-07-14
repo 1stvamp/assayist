@@ -39,9 +39,6 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 - [ ] **Adapter/workload versions are placeholders.** `AdapterVersions::default`
   is `0.0.0`. Real versions come from the running adapters in stage 4; the capture
   subcommand stamps the placeholder until then.
-- [ ] **`capture` orphans spawned children on a later spawn failure.** If gadget 2
-  fails to spawn, gadget 1 is left running. Minor for v0 (spawn failures are fast,
-  before real work); tidy with a kill-on-error guard when it matters.
 
 ## Deferred scope (orchestrator stage 1)
 
