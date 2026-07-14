@@ -1,0 +1,75 @@
+{
+  "outcome": {
+    "notes": [
+      "regressions in a single parameterisation cell (possible noise): [\"kvm.exit_handling_latency:HLT|mean\", \"kvm.exit_handling_latency:HLT|p50\"]; verdict is fail but confirm across cells or pass --strict-single-cell to treat as definitive"
+    ],
+    "per_metric": {
+      "kvm.exit_handling_latency:HLT|mean": {
+        "delta": 0.4226606195156371,
+        "noisy": false,
+        "p": 0.00019998000199980003,
+        "significant": true
+      },
+      "kvm.exit_handling_latency:HLT|p50": {
+        "delta": 1.0,
+        "noisy": false,
+        "p": 0.00019998000199980003,
+        "significant": true
+      },
+      "kvm.exit_handling_latency:HLT|p99": {
+        "delta": 0.20000000000000004,
+        "noisy": true,
+        "p": 0.4844515548445156,
+        "significant": false
+      }
+    },
+    "verdict": "fail"
+  },
+  "report": {
+    "detail": [
+      {
+        "cells": [
+          "c1"
+        ],
+        "cov": 0.017686847197573446,
+        "id": "kvm.exit_handling_latency:HLT|mean",
+        "mean_a": 1004.6661253939416,
+        "mean_b": 1429.2989323593197,
+        "n_a": 10,
+        "n_b": 10,
+        "p": 0.00019998000199980003,
+        "rel_delta": 0.4226606195156371,
+        "status": "regressed"
+      },
+      {
+        "cells": [
+          "c1"
+        ],
+        "cov": 0.0,
+        "id": "kvm.exit_handling_latency:HLT|p50",
+        "mean_a": 768.0,
+        "mean_b": 1536.0,
+        "n_a": 10,
+        "n_b": 10,
+        "p": 0.00019998000199980003,
+        "rel_delta": 1.0,
+        "status": "regressed"
+      },
+      {
+        "cells": [
+          "c1"
+        ],
+        "cov": 0.35136418446315326,
+        "id": "kvm.exit_handling_latency:HLT|p99",
+        "mean_a": 1536.0,
+        "mean_b": 1843.2,
+        "n_a": 10,
+        "n_b": 10,
+        "p": 0.4844515548445156,
+        "rel_delta": 0.20000000000000004,
+        "status": "stable"
+      }
+    ],
+    "mode": "ab_permutation"
+  }
+}

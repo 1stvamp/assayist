@@ -1,0 +1,9 @@
+GNU General Public License v2.0
+
+The Assayist eBPF objects (capture/*/src/bpf/*.bpf.c) are licensed GPL-2.0,
+because the kernel tracing helpers they use require a GPL-compatible licence.
+This is a per-file split: the .bpf.c objects are GPL-2.0, everything else is
+Apache-2.0 (see per-file SPDX headers).
+
+TODO before publishing: paste the canonical GPL-2.0 licence text here
+(https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt).

@@ -1,0 +1,26 @@
+# Assayist workspace.
+#
+# The workspace members are the host-agnostic core: the contract types, the
+# gate, and the orchestrator. They build anywhere stable Rust runs.
+#
+# The eBPF capture gadgets under capture/* are deliberately NOT workspace
+# members (they are listed in `exclude`). They need a BTF-enabled Linux host
+# with clang + bpftool to build, and the orchestrator invokes them as separate
+# binaries emitting JSON fragments, not as linked crates. Build them per-host:
+#   cd capture/kvm && cargo build --release
+[workspace]
+resolver = "2"
+members = [
+    "crates/contract",
+    "crates/gate",
+    "crates/orchestrate",
+]
+exclude = [
+    "capture/kvm",
+    "capture/block",
+    "capture/net",
+    "capture/ctrlplane",
+]
+
+[profile.release]
+opt-level = 2
