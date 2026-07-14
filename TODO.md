@@ -3,13 +3,6 @@
 Running list of flagged items and deferred scope. Point-in-time; move things
 out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md`.
 
-## OTLP
-
-- [ ] **Export uses timestamp 0 for histograms.** log2/explicit histogram data
-  points have no timestamp in the contract, so export emits `timeUnixNano: "0"`.
-  A real exporter should stamp the capture-window end; thread a timestamp through
-  or stamp at export time.
-
 ## Deferred scope (orchestrator stages 4-5)
 
 - [ ] **Host prep is not applied, only observed.** `hostprep::apply_tuning` returns

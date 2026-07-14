@@ -27,11 +27,20 @@ use sha2::{Digest, Sha256};
 
 const SCOPE_NAME: &str = "assayist";
 
-/// Both signals in one object: `{ resourceSpans, resourceMetrics }`.
+/// Both signals in one object: `{ resourceSpans, resourceMetrics }`. Uses
+/// timestamp 0 for data points the contract does not timestamp (histograms,
+/// probe cost); use [`export_at`] to stamp a real time.
 pub fn export(run: &AssayRun) -> Value {
+    export_at(run, 0)
+}
+
+/// Like [`export`] but stamps `ts` (unix nanos) onto the data points the
+/// contract carries no timestamp for. Callers typically pass the capture-window
+/// end (or export time).
+pub fn export_at(run: &AssayRun, ts: u64) -> Value {
     json!({
         "resourceSpans": export_traces(run)["resourceSpans"],
-        "resourceMetrics": export_metrics(run)["resourceMetrics"],
+        "resourceMetrics": export_metrics_at(run, ts)["resourceMetrics"],
     })
 }
 
@@ -49,9 +58,16 @@ pub fn export_traces(run: &AssayRun) -> Value {
 }
 
 /// OTLP `ExportMetricsServiceRequest`-shaped: `{ resourceMetrics: [...] }`.
+/// Stamps timestamp 0 for un-timestamped data points; see [`export_metrics_at`].
 pub fn export_metrics(run: &AssayRun) -> Value {
-    let mut metrics = series_metrics(run);
-    metrics.extend(probe_metrics(run));
+    export_metrics_at(run, 0)
+}
+
+/// Like [`export_metrics`] but stamps `ts` (unix nanos) onto histogram and
+/// probe-cost data points, which the contract carries no timestamp for.
+pub fn export_metrics_at(run: &AssayRun, ts: u64) -> Value {
+    let mut metrics = series_metrics(run, ts);
+    metrics.extend(probe_metrics(run, ts));
     json!({
         "resourceMetrics": [{
             "resource": { "attributes": resource_attributes(run) },
@@ -154,11 +170,11 @@ fn span_id(run_id: &str, name: &str, index: usize) -> String {
 
 // --- metrics ----------------------------------------------------------------
 
-fn series_metrics(run: &AssayRun) -> Vec<Value> {
-    run.series.iter().filter_map(series_to_metric).collect()
+fn series_metrics(run: &AssayRun, ts: u64) -> Vec<Value> {
+    run.series.iter().filter_map(|s| series_to_metric(s, ts)).collect()
 }
 
-fn series_to_metric(s: &Value) -> Option<Value> {
+fn series_to_metric(s: &Value, ts: u64) -> Option<Value> {
     let name = s.get("name")?.as_str()?;
     let unit = s.get("unit").and_then(|v| v.as_str()).unwrap_or("");
     let kind = s.get("kind")?.as_str()?;
@@ -172,7 +188,7 @@ fn series_to_metric(s: &Value) -> Option<Value> {
     let data = s.get("data")?;
 
     let body = match kind {
-        "histogram" => histogram_body(data, &attrs)?,
+        "histogram" => histogram_body(data, &attrs, ts)?,
         "counter" => json!({
             "sum": {
                 "isMonotonic": true,
@@ -208,8 +224,9 @@ fn series_to_metric(s: &Value) -> Option<Value> {
     Some(Value::Object(metric))
 }
 
-fn histogram_body(data: &Value, attrs: &[Value]) -> Option<Value> {
+fn histogram_body(data: &Value, attrs: &[Value], ts: u64) -> Option<Value> {
     let layout = data.get("layout").and_then(|v| v.as_str()).unwrap_or("log2");
+    let ts = Value::String(ts.to_string());
     let buckets: Vec<i64> = data
         .get("buckets")
         .and_then(|v| v.as_array())
@@ -224,6 +241,7 @@ fn histogram_body(data: &Value, attrs: &[Value]) -> Option<Value> {
             // offset 0.
             let mut dp = Map::new();
             dp.insert("attributes".into(), Value::Array(attrs.to_vec()));
+            dp.insert("timeUnixNano".into(), ts.clone());
             dp.insert("count".into(), count);
             if let Some(sum) = sum {
                 dp.insert("sum".into(), json!(sum));
@@ -249,6 +267,7 @@ fn histogram_body(data: &Value, attrs: &[Value]) -> Option<Value> {
                 .unwrap_or_default();
             let mut dp = Map::new();
             dp.insert("attributes".into(), Value::Array(attrs.to_vec()));
+            dp.insert("timeUnixNano".into(), ts.clone());
             dp.insert("count".into(), count);
             if let Some(sum) = sum {
                 dp.insert("sum".into(), json!(sum));
@@ -270,7 +289,8 @@ fn histogram_body(data: &Value, attrs: &[Value]) -> Option<Value> {
 }
 
 /// self_metrics -> the observer-effect signal as OTLP metrics.
-fn probe_metrics(run: &AssayRun) -> Vec<Value> {
+fn probe_metrics(run: &AssayRun, ts: u64) -> Vec<Value> {
+    let ts = ts.to_string();
     let mut out = Vec::new();
     for pm in &run.self_metrics {
         let mut attrs = Vec::new();
@@ -289,7 +309,7 @@ fn probe_metrics(run: &AssayRun) -> Vec<Value> {
             "gauge": { "dataPoints": [{
                 "attributes": attrs,
                 "asDouble": pm.get("steady_cpu_fraction").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                "timeUnixNano": "0",
+                "timeUnixNano": ts,
             }]},
         }));
         out.push(json!({
@@ -301,7 +321,7 @@ fn probe_metrics(run: &AssayRun) -> Vec<Value> {
                 "dataPoints": [{
                     "attributes": attrs,
                     "asInt": u64_str(pm.get("run_time_ns")),
-                    "timeUnixNano": "0",
+                    "timeUnixNano": ts,
                 }],
             },
         }));
@@ -722,6 +742,24 @@ mod tests {
         assert_eq!(dp["count"], "26");
         assert_eq!(dp["positive"]["offset"], 0);
         assert_eq!(dp["positive"]["bucketCounts"], json!(["3", "9", "14"]));
+        // default export stamps 0.
+        assert_eq!(dp["timeUnixNano"], "0");
+    }
+
+    #[test]
+    fn export_at_stamps_histogram_and_probe_timestamps() {
+        let series = vec![json!({
+            "name": "kvm.exit_latency", "unit": "ns", "kind": "histogram", "source": "kvm_exit",
+            "cardinality": {"class": "singleton"},
+            "data": {"layout": "log2", "buckets": [1], "count": 1}
+        })];
+        let sm = vec![json!({"probe_id": "p", "attach_kind": "tracepoint", "run_time_ns": 5, "steady_cpu_fraction": 0.1, "over_budget": false})];
+        let run = run_with(series, sm, vec![]);
+        let metrics = &export_metrics_at(&run, 1234)["resourceMetrics"][0]["scopeMetrics"][0]["metrics"];
+        let hist = metrics.as_array().unwrap().iter().find(|m| m["name"] == "kvm.exit_latency").unwrap();
+        assert_eq!(hist["exponentialHistogram"]["dataPoints"][0]["timeUnixNano"], "1234");
+        let cpu = metrics.as_array().unwrap().iter().find(|m| m["name"] == "assayist.probe.steady_cpu_fraction").unwrap();
+        assert_eq!(cpu["gauge"]["dataPoints"][0]["timeUnixNano"], "1234");
     }
 
     #[test]

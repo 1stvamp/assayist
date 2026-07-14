@@ -119,10 +119,16 @@ fn export_cmd(args: &[String]) -> ExitCode {
         }
     };
 
+    // Histograms and probe-cost points carry no timestamp in the contract, so
+    // stamp export time onto them.
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let doc = match signal.as_str() {
-        "both" => assayist_otlp::export(&run),
+        "both" => assayist_otlp::export_at(&run, now_nanos),
         "traces" => assayist_otlp::export_traces(&run),
-        "metrics" => assayist_otlp::export_metrics(&run),
+        "metrics" => assayist_otlp::export_metrics_at(&run, now_nanos),
         other => {
             eprintln!("unknown --signal '{other}' (want both, traces, or metrics)");
             return usage();
