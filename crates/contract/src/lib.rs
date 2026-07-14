@@ -132,6 +132,13 @@ impl AssayRun {
             series.extend(f.series.iter().cloned());
             self_metrics.extend(f.self_metrics.iter().cloned());
         }
+        // A probe ran if any fragment carried series or capture metadata. This
+        // is the signal independent of self_metrics: a gadget that produced data
+        // but no cost record leaves probes_ran true and self_metrics empty, which
+        // is exactly the case the grade must catch.
+        let probes_ran = fragments
+            .iter()
+            .any(|f| !f.series.is_empty() || f.capture_meta.is_some());
         let mut run = AssayRun {
             schema_version: SCHEMA_VERSION.to_string(),
             run_id,
@@ -144,29 +151,24 @@ impl AssayRun {
             outcome: None,
             grade: Grade::Invalid,
         };
-        run.grade = run.compute_grade();
+        run.grade = run.compute_grade(probes_ran);
         run
-    }
-
-    /// Whether any eBPF probe ran (self_metrics present).
-    fn has_probes(&self) -> bool {
-        !self.self_metrics.is_empty()
     }
 
     /// Grade per the contract. Core fields are guaranteed present by the type,
     /// so the only ways to fall below `reproducible` are inconsistent tuning
     /// (=> invalid), missing extended fields, or probes that ran without
-    /// self_metrics.
-    pub fn compute_grade(&self) -> Grade {
+    /// emitting their observer-effect self_metrics. `probes_ran` is supplied by
+    /// the producer (it knows whether any gadget fired), since a fully-assembled
+    /// run cannot tell "no probes" from "probes but no cost record" on its own.
+    pub fn compute_grade(&self, probes_ran: bool) -> Grade {
         if !self.fingerprint.tuning_consistent() {
             return Grade::Invalid;
         }
-        // If the run claims a captured source but any probe ran without cost
-        // accounting, it cannot be reproducible-grade.
-        let self_metrics_ok = !self.has_probes() || !self.self_metrics.is_empty();
         if self.identity.source == "imported" {
             return Grade::Valid;
         }
+        let self_metrics_ok = !probes_ran || !self.self_metrics.is_empty();
         if self.fingerprint.has_extended() && self_metrics_ok {
             Grade::Reproducible
         } else {
@@ -234,6 +236,30 @@ mod tests {
     fn inconsistent_tuning_is_invalid() {
         let run = AssayRun::assemble("01".into(), id(), fp(true, false), json!({}), &[], vec![]);
         assert_eq!(run.grade, Grade::Invalid);
+    }
+
+    #[test]
+    fn probes_without_self_metrics_are_not_reproducible() {
+        // A gadget produced series but no cost record: the observer-effect
+        // record is missing, so an otherwise-reproducible run drops to valid.
+        let frag = Fragment {
+            series: vec![json!({"name": "kvm.exit"})],
+            self_metrics: vec![],
+            capture_meta: Some(json!({"gadget": "assayist-capture-kvm"})),
+        };
+        let run = AssayRun::assemble("01".into(), id(), fp(true, true), json!({}), &[frag], vec![]);
+        assert_eq!(run.grade, Grade::Valid);
+    }
+
+    #[test]
+    fn probes_with_self_metrics_are_reproducible() {
+        let frag = Fragment {
+            series: vec![json!({"name": "kvm.exit"})],
+            self_metrics: vec![json!({"probe_id": "kvm_exit"})],
+            capture_meta: None,
+        };
+        let run = AssayRun::assemble("01".into(), id(), fp(true, true), json!({}), &[frag], vec![]);
+        assert_eq!(run.grade, Grade::Reproducible);
     }
 
     #[test]

@@ -124,10 +124,6 @@ fn run() -> Result<Value, String> {
         }
         m => Err(format!("unknown mode '{m}'")),
     }
-    .map(|result| {
-        // Attach the mode for downstream clarity if not present.
-        result
-    })
     .and_then(|result| {
         let out = args.out.clone();
         let text = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
