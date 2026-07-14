@@ -145,7 +145,7 @@ Every eBPF program reports its own cost. These are gated metrics, not diagnostic
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | `probe_id` | string | MUST | Matches `MetricSeries.source`. |
-| `attach_kind` | enum | MUST | `tp_btf` \| `fentry` \| `fexit` \| `kprobe` \| `kretprobe` \| `uprobe` \| `xdp`. |
+| `attach_kind` | enum | MUST | `tp_btf` \| `tracepoint` \| `fentry` \| `fexit` \| `kprobe` \| `kretprobe` \| `uprobe` \| `xdp` \| `tc`. |
 | `run_time_ns` | uint64 | MUST | Cumulative, from the kernel BPF run-time counters (`run_time_ns`). |
 | `run_cnt` | uint64 | MUST | Invocation count (`run_cnt`). |
 | `mean_ns` | float | MUST | `run_time_ns / run_cnt`, materialised so sinks do not have to. |
