@@ -8,6 +8,7 @@
 
 use assayist_contract::{AssayRun, Fingerprint, Fragment, Identity};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::def::BenchmarkDef;
 
@@ -75,18 +76,33 @@ pub fn assemble(
     AssayRun::assemble(run_id, identity, fingerprint, gate, fragments, spans)
 }
 
-/// A 128-bit run id as 32 hex chars. Not a canonical ULID yet (no lexicographic
-/// time ordering, no dedicated crate); good enough to be unique per run and to
-/// map onto an OTLP `trace_id`. See TODO.md for switching to a real ULID.
+/// A 128-bit run id in ULID layout, hex-encoded (32 chars): the high 48 bits are
+/// the unix-millisecond timestamp, the low 80 bits are entropy. Two properties
+/// matter: it maps directly onto an OTLP `trace_id` (16 bytes, hex), and the
+/// hex string sorts lexicographically by creation time (the timestamp is in the
+/// high bits). It is not the Crockford base32 canonical ULID *text* form; if a
+/// consumer needs that spelling, decode the hex and re-encode. The entropy is a
+/// hash of (nanos, pid, per-process counter), unique but not cryptographic.
 pub fn new_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let mixed = (nanos << 32) ^ pid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    format!("{mixed:032x}")
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let ms = (now.as_millis() as u128) & ((1u128 << 48) - 1);
+
+    let mut h = Sha256::new();
+    h.update(now.as_nanos().to_le_bytes());
+    h.update((std::process::id() as u64).to_le_bytes());
+    h.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let digest = h.finalize();
+    let mut entropy: u128 = 0;
+    for b in &digest[..10] {
+        entropy = (entropy << 8) | (*b as u128);
+    }
+
+    let ulid = (ms << 80) | entropy;
+    format!("{ulid:032x}")
 }
 
 #[cfg(test)]
@@ -193,9 +209,14 @@ mod tests {
     }
 
     #[test]
-    fn run_ids_are_hex_and_sized() {
-        let id = new_run_id();
-        assert_eq!(id.len(), 32);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    fn run_ids_are_hex_sized_and_distinct() {
+        let a = new_run_id();
+        let b = new_run_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        // High 48 bits are the ms timestamp, so a run made now is well past the
+        // epoch: the id is far above all-zeroes.
+        assert!(a.as_str() > "00000000000000000000000000000000");
     }
 }

@@ -25,10 +25,10 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 
 ## Deferred scope (orchestrator stage 3)
 
-- [ ] **`run_id` is not a canonical ULID.** `run::new_run_id` returns a 128-bit
-  hex string derived from time + pid, unique enough for v0 and maps to an OTLP
-  `trace_id`, but it is not lexicographically time-ordered. Switch to a real ULID
-  (dedicated crate) when it matters.
+- [ ] **`run_id` is not the canonical ULID text form.** `run::new_run_id` now uses
+  ULID layout (48-bit ms timestamp high, 80-bit entropy low), hex-encoded, so it is
+  time-ordered and a valid OTLP `trace_id`. It is not the Crockford base32 ULID
+  *string*; add that spelling only if a consumer needs it.
 - [ ] **Adapter/workload versions are placeholders.** `AdapterVersions::default`
   is `0.0.0`. Real versions come from the running adapters in stage 4; the capture
   subcommand stamps the placeholder until then.
