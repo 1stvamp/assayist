@@ -407,6 +407,117 @@ fn fio_summary(v: &Value) -> Value {
     })
 }
 
+// --- wrk workload -----------------------------------------------------------
+
+/// An HTTP load test run to completion inside the capture window. Like fio,
+/// `start` runs wrk synchronously (the gadgets are already spawned) and stashes
+/// its stdout; `report` parses the text summary into requests/sec, transfer/sec,
+/// average/max latency, and total requests. wrk has no native JSON output, so
+/// the parse is text-based and liberal (missing fields become null). The report
+/// is opaque provenance, no grading effect.
+pub struct WrkWorkload {
+    bin: String,
+    args: Vec<String>,
+    out: RefCell<Option<String>>,
+}
+
+pub fn wrk_workload(
+    config: &BTreeMap<String, Value>,
+    vars: &BTreeMap<String, String>,
+) -> WrkWorkload {
+    let g = |k: &str, d: &str| cfg(config, vars, k, d);
+    let mut args = vec![
+        format!("-t{}", g("threads", "2")),
+        format!("-c{}", g("connections", "10")),
+        format!("-d{}s", g("duration", "30")),
+        "--latency".to_string(),
+    ];
+    // Optional constant request rate (wrk2-style) and Lua script.
+    if config.contains_key("rate") {
+        args.push(format!("-R{}", g("rate", "")));
+    }
+    if config.contains_key("script") {
+        args.push(format!("-s{}", g("script", "")));
+    }
+    args.push(g("url", "http://127.0.0.1:8080/"));
+    WrkWorkload { bin: g("bin", "wrk"), args, out: RefCell::new(None) }
+}
+
+impl Workload for WrkWorkload {
+    fn version(&self, sh: &dyn Shell) -> String {
+        // wrk prints its version to stderr and exits non-zero, so `run` reports
+        // an error; fall back to the driver name rather than a bogus version.
+        match sh.run(&format!("'{}' --version 2>&1", self.bin)) {
+            Ok(out) => version_token(&out),
+            Err(_) => "wrk".to_string(),
+        }
+    }
+
+    fn start(&self, sh: &dyn Shell) -> Result<(), String> {
+        let quoted: Vec<String> = self.args.iter().map(|a| format!("'{a}'")).collect();
+        let out = sh.run(&format!("'{}' {}", self.bin, quoted.join(" ")))?;
+        *self.out.borrow_mut() = Some(out);
+        Ok(())
+    }
+
+    fn stop(&self, _sh: &dyn Shell) -> Result<(), String> {
+        // wrk ran to completion in `start`; nothing to stop.
+        Ok(())
+    }
+
+    fn report(&self, _sh: &dyn Shell) -> Result<Value, String> {
+        match self.out.borrow().as_ref() {
+            Some(text) => Ok(wrk_summary(text)),
+            None => Ok(Value::Null),
+        }
+    }
+}
+
+/// Parse wrk's text summary. Liberal: any field it cannot find stays null.
+fn wrk_summary(text: &str) -> Value {
+    // "Requests/sec:  8123.40" / "Transfer/sec:   1.23MB"
+    let after_colon = |label: &str| -> Option<String> {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(label))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().to_string())
+    };
+    let req_per_sec = after_colon("Requests/sec")
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| json!(f))
+        .unwrap_or(Value::Null);
+    let transfer_per_sec = after_colon("Transfer/sec").map(Value::String).unwrap_or(Value::Null);
+
+    // "    Latency   1.23ms   0.45ms   10.50ms   80.00%": avg is the first
+    // whitespace token after the "Latency" label.
+    let latency_field = |label: &str, idx: usize| -> Value {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(label))
+            .and_then(|l| l.trim_start().strip_prefix(label))
+            .and_then(|rest| rest.split_whitespace().nth(idx))
+            .map(|s| Value::String(s.to_string()))
+            .unwrap_or(Value::Null)
+    };
+
+    // "  81234 requests in 10.00s, 12.34MB read"
+    let total_requests = text
+        .lines()
+        .find(|l| l.contains("requests in"))
+        .and_then(|l| l.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|n| json!(n))
+        .unwrap_or(Value::Null);
+
+    json!({
+        "driver": "wrk",
+        "requests_per_sec": req_per_sec,
+        "transfer_per_sec": transfer_per_sec,
+        "latency_avg": latency_field("Latency", 0),
+        "latency_max": latency_field("Latency", 2),
+        "total_requests": total_requests,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +749,69 @@ mod tests {
         // FakeShell returns empty string (never errors), so version_token yields "".
         let sh = FakeShell::new().reply("--version", "fio-3.36");
         assert_eq!(w.version(&sh), "fio-3.36");
+    }
+
+    #[test]
+    fn wrk_start_builds_command_and_reports_summary() {
+        let out = "Running 10s test @ http://127.0.0.1:8080/\n\
+             \x20 2 threads and 10 connections\n\
+             \x20 Thread Stats   Avg      Stdev     Max   +/- Stdev\n\
+             \x20   Latency     1.23ms    0.45ms   10.50ms   80.00%\n\
+             \x20   Req/Sec     4.10k     0.50k     5.00k    75.00%\n\
+             \x20 Latency Distribution\n\
+             \x20    50%    1.10ms\n\
+             \x20 81234 requests in 10.00s, 12.34MB read\n\
+             Requests/sec:   8123.40\n\
+             Transfer/sec:      1.23MB\n";
+        let cfg = config(&[
+            ("url", json!("http://{host}:8080/")),
+            ("threads", json!("4")),
+            ("connections", json!("100")),
+            ("duration", json!("5")),
+        ]);
+        let w = wrk_workload(&cfg, &vars(&[("host", "10.0.0.5")]));
+        // Reply keyed on a substring of the wrk command line (the rendered url).
+        let sh = FakeShell::new().reply("http://10.0.0.5:8080/", out);
+
+        w.start(&sh).unwrap();
+        w.stop(&sh).unwrap();
+
+        assert!(sh.saw("-t4"));
+        assert!(sh.saw("-c100"));
+        assert!(sh.saw("-d5s"));
+        assert!(sh.saw("http://10.0.0.5:8080/")); // param rendered
+
+        let rep = w.report(&sh).unwrap();
+        assert_eq!(rep["driver"], "wrk");
+        assert_eq!(rep["requests_per_sec"], 8123.40);
+        assert_eq!(rep["transfer_per_sec"], "1.23MB");
+        assert_eq!(rep["latency_avg"], "1.23ms");
+        assert_eq!(rep["latency_max"], "10.50ms");
+        assert_eq!(rep["total_requests"], 81234);
+    }
+
+    #[test]
+    fn wrk_report_is_null_before_a_run() {
+        let w = wrk_workload(&config(&[("url", json!("http://x/"))]), &vars(&[]));
+        let sh = FakeShell::new();
+        assert_eq!(w.report(&sh).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn wrk_rate_and_script_are_optional_flags() {
+        let base = wrk_workload(&config(&[("url", json!("http://x/"))]), &vars(&[]));
+        let sh = FakeShell::new();
+        base.start(&sh).unwrap();
+        assert!(!sh.saw("-R"));
+        assert!(!sh.saw("-s"));
+
+        let withopts = wrk_workload(
+            &config(&[("url", json!("http://x/")), ("rate", json!("2000")), ("script", json!("/s.lua"))]),
+            &vars(&[]),
+        );
+        let sh2 = FakeShell::new();
+        withopts.start(&sh2).unwrap();
+        assert!(sh2.saw("-R2000"));
+        assert!(sh2.saw("-s/s.lua"));
     }
 }
