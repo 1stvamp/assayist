@@ -158,7 +158,7 @@ pub fn vars(params: &Value, sut_sha: &str) -> BTreeMap<String, String> {
     m
 }
 
-fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
+pub(crate) fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
     let mut s = template.to_string();
     for (k, v) in vars {
         s = s.replace(&format!("{{{k}}}"), v);

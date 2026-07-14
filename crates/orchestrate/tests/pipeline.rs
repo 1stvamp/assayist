@@ -77,15 +77,17 @@ JSON
     fs::set_permissions(&gadget, fs::Permissions::from_mode(0o755)).unwrap();
 
     // Def: no host_prep (so tuning is trivially consistent), no-op command
-    // adapters, one stub gadget.
+    // adapters (the `command` adapter no-ops on absent phases; `firecracker` /
+    // `fio` now dispatch to the native adapters, which need a real host), one
+    // stub gadget.
     let def = dir.join("demo.assay.yaml");
     fs::write(
         &def,
         format!(
             r#"apiVersion: assayist/v0
 name: pipeline-it
-target: {{ adapter: firecracker, version: ">=0.3" }}
-workload: {{ driver: fio-libaio }}
+target: {{ adapter: command }}
+workload: {{ driver: command }}
 gate:
   mode: ab_permutation
   p_threshold: 0.01

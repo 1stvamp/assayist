@@ -16,9 +16,15 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
   fingerprint once (apply-or-observe) and clones it into every assembled run. Fine
   while the host is static; re-read per run so prep state that drifts between the A
   and B SUT builds is caught.
-- [ ] **Command adapters are the only adapter.** The `Target`/`Workload` traits are
-  the SPI; only the shell command-adapter implements them. Real `firecracker`/`fio`
-  adapters (native Rust, with genuine lifecycle spans and versions) come next.
+- [ ] **Native adapters are unexercised against a real host.** `native.rs` ships
+  a firecracker target (curl over the api-sock: cold-boot `boot.api_to_init`,
+  restore `restore.resume_to_steady`, steady-state `snapshot.create`) and an fio
+  workload (fio CLI, JSON report). Both are unit-tested against a fake shell only;
+  neither has run against real firecracker/fio yet (needs a KVM host). The
+  `boot.api_to_init` span times the InstanceStart API round-trip, not the guest
+  reaching init: honest guest-init timing needs an in-guest signal the agentless
+  vantage deliberately does not have. Validate on a KVM host, then decide whether
+  a coarse boot span is worth keeping or should be dropped.
 
 ## Deferred scope (orchestrator stage 3)
 

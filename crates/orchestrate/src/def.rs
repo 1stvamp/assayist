@@ -49,6 +49,11 @@ pub struct Target {
     /// (`provision`/`start`/`reach_steady`/`spans`/`teardown`/`version`).
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
+    /// Native-adapter settings (e.g. the firecracker adapter's `kernel`,
+    /// `rootfs`, `api_sock`). Ignored by the command adapter; string values may
+    /// reference cell params as `{name}`.
+    #[serde(default)]
+    pub config: BTreeMap<String, Value>,
 }
 
 #[allow(dead_code)]
@@ -61,6 +66,11 @@ pub struct Workload {
     /// (`start`/`stop`/`report`/`version`).
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
+    /// Native-adapter settings (e.g. the fio adapter's `filename`, `rw`, `bs`).
+    /// Ignored by the command adapter; string values may reference cell params
+    /// as `{name}`.
+    #[serde(default)]
+    pub config: BTreeMap<String, Value>,
 }
 
 #[allow(dead_code)]
@@ -302,8 +312,18 @@ mod tests {
         let def = BenchmarkDef {
             api_version: "assayist/v0".into(),
             name: "n".into(),
-            target: Target { adapter: "a".into(), version: String::new(), commands: BTreeMap::new() },
-            workload: Workload { driver: "w".into(), version: String::new(), commands: BTreeMap::new() },
+            target: Target {
+                adapter: "a".into(),
+                version: String::new(),
+                commands: BTreeMap::new(),
+                config: BTreeMap::new(),
+            },
+            workload: Workload {
+                driver: "w".into(),
+                version: String::new(),
+                commands: BTreeMap::new(),
+                config: BTreeMap::new(),
+            },
             gate: GateSpec {
                 mode: "ab_permutation".into(),
                 p_threshold: None,
