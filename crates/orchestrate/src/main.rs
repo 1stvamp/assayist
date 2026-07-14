@@ -35,6 +35,8 @@ fn usage() -> ExitCode {
     eprintln!("      parse, validate, expand a def and observe the host (read-only).");
     eprintln!("  assayist export <run.json> [--signal both|traces|metrics] [--out PATH]");
     eprintln!("      transform an assembled AssayRun into OTLP/JSON.");
+    eprintln!("  assayist import <otlp.json> [--out PATH]");
+    eprintln!("      transform an OTLP/JSON document into an AssayRun (grade: valid).");
     ExitCode::from(64) // EX_USAGE
 }
 
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
             None => usage(),
         },
         Some("export") => export_cmd(&args[1..]),
+        Some("import") => import_cmd(&args[1..]),
         _ => usage(),
     }
 }
@@ -130,6 +133,84 @@ fn export_cmd(args: &[String]) -> ExitCode {
         Ok(j) => j,
         Err(e) => {
             eprintln!("serialising OTLP: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if out == "-" {
+        println!("{json}");
+    } else if let Err(e) = std::fs::write(&out, json) {
+        eprintln!("writing {out}: {e}");
+        return ExitCode::from(1);
+    }
+    ExitCode::from(0)
+}
+
+// ---------------------------------------------------------------------------
+// import: OTLP/JSON -> AssayRun JSON.
+// ---------------------------------------------------------------------------
+
+fn import_cmd(args: &[String]) -> ExitCode {
+    let mut in_path: Option<String> = None;
+    let mut out = "-".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out = v.clone(),
+                    None => {
+                        eprintln!("missing value after --out");
+                        return usage();
+                    }
+                }
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag {other}");
+                return usage();
+            }
+            other => {
+                if in_path.is_some() {
+                    eprintln!("unexpected argument {other}");
+                    return usage();
+                }
+                in_path = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = in_path else {
+        eprintln!("import needs an <otlp.json> path");
+        return usage();
+    };
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("reading {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("parsing OTLP from {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let run = match assayist_otlp::import(&doc) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("importing OTLP: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let json = match serde_json::to_string_pretty(&run) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("serialising run: {e}");
             return ExitCode::from(1);
         }
     };

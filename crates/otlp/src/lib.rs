@@ -351,6 +351,279 @@ fn grade_str(g: &Grade) -> &'static str {
     }
 }
 
+// --- import -----------------------------------------------------------------
+
+/// Import an OTLP/JSON document (with `resourceSpans` and/or `resourceMetrics`)
+/// into an AssayRun. This is the graceful-degradation path: it fills what maps
+/// (spans, exponential histograms -> log2 series, `host.*`/`os.*` -> fingerprint
+/// core) and leaves the benchmark-only fields empty. The run is stamped
+/// `identity.source = imported` and grades `valid` (never `reproducible`),
+/// because self_metrics and the full fingerprint cannot be reconstructed.
+pub fn import(doc: &Value) -> Result<AssayRun, String> {
+    let attrs = doc
+        .get("resourceSpans")
+        .and_then(|rs| rs.get(0))
+        .or_else(|| doc.get("resourceMetrics").and_then(|rm| rm.get(0)))
+        .map(|r| r["resource"]["attributes"].clone())
+        .unwrap_or(Value::Array(vec![]));
+
+    let spans = import_spans(doc);
+    let series = import_series(doc);
+
+    let run_id = spans
+        .first()
+        .and_then(|s| s.get("_trace_id").and_then(|v| v.as_str()))
+        .map(String::from)
+        .unwrap_or_default();
+    // Strip the private carrier now that the run id is lifted out.
+    let spans: Vec<Value> = spans
+        .into_iter()
+        .map(|mut s| {
+            if let Some(o) = s.as_object_mut() {
+                o.remove("_trace_id");
+            }
+            s
+        })
+        .collect();
+
+    let fingerprint = assayist_contract::Fingerprint {
+        hostname: attr_str(&attrs, "host.name").unwrap_or_default(),
+        kernel_version: attr_str(&attrs, "os.version").unwrap_or_default(),
+        os_release: attr_str(&attrs, "os.description").unwrap_or_default(),
+        cpu_model: attr_str(&attrs, "host.cpu.model.name").unwrap_or_default(),
+        cpu_count_logical: attr_int(&attrs, "assayist.host.cpu_count_logical").unwrap_or(0) as u32,
+        cpu_count_physical: attr_int(&attrs, "assayist.host.cpu_count_physical").unwrap_or(0) as u32,
+        smt_enabled: attr_bool(&attrs, "assayist.host.smt_enabled").unwrap_or(false),
+        cpu_governor: attr_str(&attrs, "assayist.host.cpu_governor").unwrap_or_else(|| "unknown".into()),
+        thp_setting: attr_str(&attrs, "assayist.host.thp").unwrap_or_else(|| "unknown".into()),
+        total_memory_bytes: attr_int(&attrs, "assayist.host.memory_bytes").unwrap_or(0) as u64,
+        kvm_present: attr_bool(&attrs, "assayist.host.kvm").unwrap_or(false),
+        tenancy: attr_str(&attrs, "assayist.run.tenancy").unwrap_or_else(|| "single_tenant".into()),
+        // Consistent (both empty) so the run does not grade invalid; imported
+        // runs carry no tuning record.
+        tuning_requested: json!({}),
+        tuning_readback: json!({}),
+        // Extended fields cannot be reconstructed: partial fingerprint.
+        numa_topology: None,
+        pinning_layout: None,
+        mitigations: None,
+        microcode_version: None,
+        nested_virt: None,
+    };
+
+    let identity = assayist_contract::Identity {
+        target_adapter: attr_str(&attrs, "assayist.target_adapter").unwrap_or_else(|| "unknown".into()),
+        target_adapter_version: attr_str(&attrs, "assayist.target_adapter_version").unwrap_or_else(|| "unknown".into()),
+        workload_driver: attr_str(&attrs, "assayist.workload_driver").unwrap_or_else(|| "unknown".into()),
+        workload_driver_version: attr_str(&attrs, "assayist.workload_driver_version").unwrap_or_else(|| "unknown".into()),
+        sut_git_sha: attr_str(&attrs, "assayist.sut_git_sha").unwrap_or_else(|| "unknown".into()),
+        params: json!({}),
+        params_hash: attr_str(&attrs, "assayist.params_hash").unwrap_or_default(),
+        benchmark_def_sha: attr_str(&attrs, "assayist.benchmark_def_sha").unwrap_or_default(),
+        source: "imported".into(),
+    };
+
+    let mut run = AssayRun {
+        schema_version: assayist_contract::SCHEMA_VERSION.to_string(),
+        run_id,
+        identity,
+        fingerprint,
+        spans,
+        series,
+        self_metrics: vec![], // never reconstructed on import
+        gate: json!({}),
+        outcome: None,
+        grade: Grade::Invalid,
+    };
+    // Imported source -> Valid (compute_grade short-circuits on source).
+    run.grade = run.compute_grade(false);
+    Ok(run)
+}
+
+fn import_spans(doc: &Value) -> Vec<Value> {
+    let mut raw: Vec<&Value> = Vec::new();
+    if let Some(rs) = doc.get("resourceSpans").and_then(|v| v.as_array()) {
+        for r in rs {
+            if let Some(ss) = r.get("scopeSpans").and_then(|v| v.as_array()) {
+                for s in ss {
+                    if let Some(spans) = s.get("spans").and_then(|v| v.as_array()) {
+                        raw.extend(spans.iter());
+                    }
+                }
+            }
+        }
+    }
+    // Map span id -> name so parentSpanId resolves back to a parent name.
+    let mut name_by_id: Map<String, Value> = Map::new();
+    for s in &raw {
+        if let (Some(id), Some(name)) = (
+            s.get("spanId").and_then(|v| v.as_str()),
+            s.get("name").and_then(|v| v.as_str()),
+        ) {
+            name_by_id.insert(id.to_string(), Value::String(name.to_string()));
+        }
+    }
+
+    raw.into_iter()
+        .map(|s| {
+            let mut out = Map::new();
+            out.insert("name".into(), s.get("name").cloned().unwrap_or(Value::Null));
+            out.insert("start_unix_nano".into(), json!(str_u64(s.get("startTimeUnixNano"))));
+            out.insert("end_unix_nano".into(), json!(str_u64(s.get("endTimeUnixNano"))));
+            if let Some(pid) = s.get("parentSpanId").and_then(|v| v.as_str()) {
+                if let Some(name) = name_by_id.get(pid) {
+                    out.insert("parent".into(), name.clone());
+                }
+            }
+            let attrs = kv_list_to_object(s.get("attributes"));
+            if !attrs.is_empty() {
+                out.insert("attributes".into(), Value::Object(attrs));
+            }
+            // Private carrier for the run id; stripped by the caller.
+            if let Some(tid) = s.get("traceId").and_then(|v| v.as_str()) {
+                out.insert("_trace_id".into(), json!(tid));
+            }
+            Value::Object(out)
+        })
+        .collect()
+}
+
+fn import_series(doc: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Some(rm) = doc.get("resourceMetrics").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for r in rm {
+        let Some(sms) = r.get("scopeMetrics").and_then(|v| v.as_array()) else { continue };
+        for sm in sms {
+            let Some(metrics) = sm.get("metrics").and_then(|v| v.as_array()) else { continue };
+            for m in metrics {
+                let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                // Probe-cost metrics are not series; imported runs have no self_metrics.
+                if name.starts_with("assayist.probe.") {
+                    continue;
+                }
+                if let Some(s) = metric_to_series(m) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn metric_to_series(m: &Value) -> Option<Value> {
+    let name = m.get("name")?.as_str()?;
+    let unit = m.get("unit").and_then(|v| v.as_str()).unwrap_or("");
+    let mut s = Map::new();
+    s.insert("name".into(), json!(name));
+    s.insert("unit".into(), json!(unit));
+
+    if let Some(eh) = m.get("exponentialHistogram") {
+        let dp = eh.get("dataPoints")?.get(0)?;
+        let buckets = str_array_u64(dp.get("positive").and_then(|p| p.get("bucketCounts")));
+        s.insert("kind".into(), json!("histogram"));
+        carry_source_key(dp, &mut s);
+        let mut data = json!({
+            "layout": "log2",
+            "buckets": buckets,
+            "count": str_u64(dp.get("count")),
+        });
+        if let Some(sum) = dp.get("sum").and_then(|v| v.as_f64()) {
+            data["sum"] = json!(sum);
+        }
+        s.insert("data".into(), data);
+    } else if let Some(h) = m.get("histogram") {
+        let dp = h.get("dataPoints")?.get(0)?;
+        s.insert("kind".into(), json!("histogram"));
+        carry_source_key(dp, &mut s);
+        let mut data = json!({
+            "layout": "explicit",
+            "buckets": str_array_u64(dp.get("bucketCounts")),
+            "explicit_bounds": dp.get("explicitBounds").cloned().unwrap_or(json!([])),
+            "count": str_u64(dp.get("count")),
+        });
+        if let Some(sum) = dp.get("sum").and_then(|v| v.as_f64()) {
+            data["sum"] = json!(sum);
+        }
+        s.insert("data".into(), data);
+    } else if let Some(sum) = m.get("sum") {
+        let dp = sum.get("dataPoints")?.get(0)?;
+        s.insert("kind".into(), json!("counter"));
+        carry_source_key(dp, &mut s);
+        s.insert("data".into(), json!({ "value": str_u64(dp.get("asInt")), "start_unix_nano": str_u64(dp.get("timeUnixNano")) }));
+    } else if let Some(g) = m.get("gauge") {
+        let dp = g.get("dataPoints")?.get(0)?;
+        s.insert("kind".into(), json!("gauge"));
+        carry_source_key(dp, &mut s);
+        s.insert("data".into(), json!({ "value": dp.get("asDouble").and_then(|v| v.as_f64()).unwrap_or(0.0), "time_unix_nano": str_u64(dp.get("timeUnixNano")) }));
+    } else {
+        return None;
+    }
+    Some(Value::Object(s))
+}
+
+fn carry_source_key(dp: &Value, s: &mut Map<String, Value>) {
+    if let Some(src) = dp_attr(dp, "assayist.source") {
+        s.insert("source".into(), json!(src));
+    }
+    if let Some(key) = dp_attr(dp, "assayist.key") {
+        s.insert("key".into(), json!(key));
+    }
+}
+
+fn dp_attr(dp: &Value, key: &str) -> Option<String> {
+    attr_str(dp.get("attributes")?, key)
+}
+
+// OTLP/JSON attribute readers.
+fn attr_val<'a>(attrs: &'a Value, key: &str) -> Option<&'a Value> {
+    attrs.as_array()?.iter().find(|a| a["key"] == key).map(|a| &a["value"])
+}
+fn attr_str(attrs: &Value, key: &str) -> Option<String> {
+    attr_val(attrs, key)?.get("stringValue")?.as_str().map(String::from)
+}
+fn attr_int(attrs: &Value, key: &str) -> Option<i64> {
+    let v = attr_val(attrs, key)?.get("intValue")?;
+    v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_i64())
+}
+fn attr_bool(attrs: &Value, key: &str) -> Option<bool> {
+    attr_val(attrs, key)?.get("boolValue")?.as_bool()
+}
+
+fn kv_list_to_object(v: Option<&Value>) -> Map<String, Value> {
+    let mut m = Map::new();
+    let Some(arr) = v.and_then(|x| x.as_array()) else { return m };
+    for kv in arr {
+        let Some(k) = kv.get("key").and_then(|x| x.as_str()) else { continue };
+        let val = kv.get("value");
+        let plain = if let Some(s) = val.and_then(|x| x.get("stringValue")).and_then(|x| x.as_str()) {
+            json!(s)
+        } else if let Some(b) = val.and_then(|x| x.get("boolValue")).and_then(|x| x.as_bool()) {
+            json!(b)
+        } else if let Some(d) = val.and_then(|x| x.get("doubleValue")).and_then(|x| x.as_f64()) {
+            json!(d)
+        } else if let Some(i) = val.and_then(|x| x.get("intValue")) {
+            i.as_str().and_then(|s| s.parse::<i64>().ok()).map(|n| json!(n)).unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        m.insert(k.to_string(), plain);
+    }
+    m
+}
+
+fn str_u64(v: Option<&Value>) -> u64 {
+    v.and_then(|x| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_u64()))
+        .unwrap_or(0)
+}
+
+fn str_array_u64(v: Option<&Value>) -> Vec<u64> {
+    v.and_then(|x| x.as_array())
+        .map(|a| a.iter().map(|x| str_u64(Some(x))).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +758,86 @@ mod tests {
         let doc = export(&run);
         assert!(doc.get("resourceSpans").is_some());
         assert!(doc.get("resourceMetrics").is_some());
+    }
+
+    #[test]
+    fn round_trips_through_export_and_import() {
+        let series = vec![
+            json!({
+                "name": "kvm.exit_latency", "unit": "ns", "kind": "histogram", "source": "kvm_exit",
+                "cardinality": {"class": "singleton"},
+                "data": {"layout": "log2", "buckets": [3, 9, 14], "count": 26, "sum": 4242}
+            }),
+            json!({
+                "name": "block.io_bytes", "unit": "By", "kind": "counter", "source": "block",
+                "cardinality": {"class": "singleton"},
+                "data": {"value": 4096, "start_unix_nano": 5}
+            }),
+        ];
+        let sm = vec![json!({
+            "probe_id": "kvm_exit", "attach_kind": "tracepoint",
+            "run_time_ns": 41200, "run_cnt": 1, "mean_ns": 3.2,
+            "steady_cpu_fraction": 0.0075, "over_budget": false
+        })];
+        let spans = vec![
+            json!({"name": "boot", "start_unix_nano": 10, "end_unix_nano": 20}),
+            json!({"name": "boot.init", "parent": "boot", "start_unix_nano": 11, "end_unix_nano": 19}),
+        ];
+        let run = run_with(series, sm, spans);
+
+        let doc = export(&run);
+        let back = import(&doc).unwrap();
+
+        // Imported runs are always valid, never reproducible, with no self_metrics.
+        assert_eq!(back.identity.source, "imported");
+        assert_eq!(back.grade, Grade::Valid);
+        assert!(back.self_metrics.is_empty());
+
+        // Fingerprint core lifted from resource attrs.
+        assert_eq!(back.fingerprint.hostname, "lab");
+        assert_eq!(back.fingerprint.kernel_version, "6.11.0");
+
+        // run_id lifted from traceId.
+        assert_eq!(back.run_id, "0123456789abcdef0123456789abcdef");
+
+        // Spans preserved with parent resolved back to a name.
+        assert_eq!(back.spans.len(), 2);
+        assert_eq!(back.spans[1]["name"], "boot.init");
+        assert_eq!(back.spans[1]["parent"], "boot");
+        assert_eq!(back.spans[0]["start_unix_nano"], 10);
+
+        // The two series come back (probe metrics are dropped, not turned into series).
+        assert_eq!(back.series.len(), 2);
+        let hist = back.series.iter().find(|s| s["name"] == "kvm.exit_latency").unwrap();
+        assert_eq!(hist["kind"], "histogram");
+        assert_eq!(hist["data"]["layout"], "log2");
+        assert_eq!(hist["data"]["buckets"], json!([3, 9, 14]));
+        assert_eq!(hist["data"]["count"], 26);
+        assert_eq!(hist["source"], "kvm_exit");
+        let ctr = back.series.iter().find(|s| s["name"] == "block.io_bytes").unwrap();
+        assert_eq!(ctr["kind"], "counter");
+        assert_eq!(ctr["data"]["value"], 4096);
+    }
+
+    #[test]
+    fn imports_metrics_only_document() {
+        let doc = json!({
+            "resourceMetrics": [{
+                "resource": { "attributes": [
+                    { "key": "host.name", "value": { "stringValue": "remote" } },
+                    { "key": "os.version", "value": { "stringValue": "5.15.0" } }
+                ]},
+                "scopeMetrics": [{ "scope": { "name": "otel" }, "metrics": [{
+                    "name": "app.latency", "unit": "ns",
+                    "gauge": { "dataPoints": [{ "asDouble": 1.5, "timeUnixNano": "0" }] }
+                }]}]
+            }]
+        });
+        let run = import(&doc).unwrap();
+        assert_eq!(run.fingerprint.hostname, "remote");
+        assert_eq!(run.identity.source, "imported");
+        assert_eq!(run.grade, Grade::Valid);
+        assert_eq!(run.series.len(), 1);
+        assert_eq!(run.series[0]["kind"], "gauge");
     }
 }

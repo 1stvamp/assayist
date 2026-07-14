@@ -20,8 +20,7 @@ Verified by execution here: the `contract` crate and the `gate` (permutation A/B
 | Net gadget (tap counters + size hist) | `capture/net` | written |
 | Ctrlplane gadget (runqueue latency, on-CPU) | `capture/ctrlplane` | written |
 | Orchestrator | `crates/orchestrate` | v0 complete: `run` (full A/B pipeline), `capture`, `inspect`. Host-prep apply pending (observe-only), native adapters pending |
-| OTLP export | `crates/otlp` | built, tested (traces + metrics); wired as `assayist export` |
-| OTLP import | (design in contract-v0.md) | not built |
+| OTLP export + import | `crates/otlp` | built, tested (round-trip); wired as `assayist export` / `assayist import` |
 | Reference target/workload adapters | `adapters/` | empty |
 
 ## Build and verify
@@ -61,7 +60,7 @@ Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub g
 
 ## After the orchestrator
 
-1. ~~OTLP export~~ done (`crates/otlp`, `assayist export`): run_id -> trace_id, spans with deterministic ids, log2 -> exponential scale 0, explicit -> histogram, counter -> sum, gauge -> gauge, self_metrics -> `assayist.probe.*`, fingerprint/identity -> resource attrs (semconv where it exists). Remaining: OTLP **import** (OTLP -> AssayRun, degrades to `grade: valid`, sets `identity.source = imported`).
+1. ~~OTLP export + import~~ done (`crates/otlp`, `assayist export` / `assayist import`). Export: run_id -> trace_id, spans with deterministic ids, log2 -> exponential scale 0, explicit -> histogram, counter -> sum, gauge -> gauge, self_metrics -> `assayist.probe.*`, fingerprint/identity -> resource attrs (semconv where it exists). Import degrades gracefully: fills spans + series + fingerprint core, no self_metrics, `identity.source = imported`, `grade: valid`. Round-trip tested.
 2. Reference adapters: `firecracker` target (boot/snapshot/restore spans), `fio` and `wrk` workloads.
 3. Finer histograms for tail gating: log2-derived p50/p99 are too coarse to gate on (see gate README); add an explicit/high-resolution histogram option for metrics whose tail you need to gate.
 4. Optional: refactor the gate to read via the `contract` crate types where it helps, but keep it liberal in what it accepts.
