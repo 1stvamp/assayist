@@ -29,11 +29,24 @@ Generate `vmlinux.h` once from the running kernel's BTF:
 bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/bpf/vmlinux.h
 ```
 
+If KVM is a module on your kernel (check `lsmod | grep kvm`), the `kvm_exit`/
+`kvm_entry` tracepoint structs (`trace_event_raw_kvm_exit`) live in the module's
+BTF, not core vmlinux BTF, and the header above only carries a forward
+declaration, so the build fails with `incomplete definition of type`. Dump from
+the module BTF instead (it emits the full base+module closure):
+
+```
+bpftool btf dump file /sys/kernel/btf/kvm format c > src/bpf/vmlinux.h
+```
+
 Then:
 
 ```
 cargo build --release
 ```
+
+Verified on Ubuntu 24.04, kernel 6.8, inside a nested-KVM Incus VM: builds with
+the module-BTF header and captures a Firecracker microVM's exits from the host.
 
 ## Run
 

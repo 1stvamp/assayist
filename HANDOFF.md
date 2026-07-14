@@ -15,13 +15,13 @@ Verified by execution here: the `contract` crate and the `gate` (permutation A/B
 | Contract spec + JSON Schema | `docs/contract-v0.md`, `contract/assay-run.schema.json` | drafted v0 |
 | Typed producer model + grading | `crates/contract` | built, 4 tests pass |
 | Gate | `crates/gate` | built, 5 tests pass, 6 scenarios verified |
-| KVM gadget (exit-handling latency) | `capture/kvm` | written |
+| KVM gadget (exit-handling latency) | `capture/kvm` | built + run: captured 100k+ real exits from a Firecracker microVM in a nested-KVM Incus VM |
 | Block gadget (per-device IO latency) | `capture/block` | written |
 | Net gadget (tap counters + size hist) | `capture/net` | written |
 | Ctrlplane gadget (runqueue latency, on-CPU) | `capture/ctrlplane` | written |
 | Orchestrator | `crates/orchestrate` | v0 complete: `run` (A/B pipeline, `--apply-prep` writes host tuning), `capture`, `inspect`, `export`/`import`. `pinning_layout` + native adapters pending |
 | OTLP export + import | `crates/otlp` | built, tested (round-trip); wired as `assayist export` / `assayist import` |
-| Native firecracker target + fio workload | `crates/orchestrate/src/native.rs` | built, unit-tested vs fake shell; unexercised on a real KVM host |
+| Native firecracker target + fio workload | `crates/orchestrate/src/native.rs` | built + run end-to-end in a nested-KVM Incus VM: booted real microVMs, real fio reports, assembled+gated |
 
 ## Build and verify
 
@@ -87,6 +87,8 @@ Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub g
 - `name_to_handle_at` cgroup-id resolution (ctrlplane) assumes cgroup v2 kernfs handles; `--cgroup-id` is the escape hatch.
 - The two LICENSE files hold TODO placeholders for canonical text. Fill before publishing.
 - Contract additions so far (all additive on v0): `attach_kind` gained `tracepoint` and `tc`; `key_source` gained `device` and `netdev`; `AssayRun` gained an optional `workload_report` (opaque provenance, no grading/gating effect). Keep additions additive.
+- Module tracepoint BTF: on kernels where KVM is a module (the common case), `trace_event_raw_kvm_exit` is in `/sys/kernel/btf/kvm`, not core vmlinux BTF. Generate the kvm gadget's `vmlinux.h` from the module BTF or the build fails with `incomplete definition of type`. See `capture/kvm/README.md`.
+- ProbeCost in nested virt: running the kvm gadget inside a nested-KVM VM cost ~1.2% steady CPU per probe (`over_budget: true`), so the gate correctly graded the run `contaminated`. That is the self-metrics guarantee working, not a bug; expect lower cost on bare metal, but always read `over_budget` before trusting a run.
 
 ## File map
 
