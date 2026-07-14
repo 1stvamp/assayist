@@ -132,6 +132,13 @@ pub struct Cell {
 const GATE_MODES: [&str; 3] = ["ab_permutation", "longitudinal_drift", "subsystem_triad"];
 const TENANCIES: [&str; 2] = ["single_tenant", "density"];
 const CARD_CLASSES: [&str; 2] = ["singleton", "bounded"];
+/// The contract's `attach_kind` vocabulary (see `contract/assay-run.schema.json`).
+/// Attach kind is author-declared, not discovered: the orchestrator does not run
+/// a gadget to introspect it, and the load-time uprobe-on-hot-path rejection has
+/// to work off static def data. A declared `attach` is validated against this so
+/// a typo cannot silently skip the hot-path check.
+const ATTACH_KINDS: [&str; 9] =
+    ["tp_btf", "tracepoint", "fentry", "fexit", "kprobe", "kretprobe", "uprobe", "xdp", "tc"];
 
 /// Parse a def from YAML text and compute its `benchmark_def_sha` over the raw
 /// bytes. Hashing the source text keeps the identity honest: diff the file, get
@@ -180,6 +187,14 @@ pub fn validate(def: &BenchmarkDef) -> Result<(), Vec<String>> {
                 None => errs.push(format!("{where_}: bounded cardinality needs max_keys")),
                 Some(0) => errs.push(format!("{where_}: bounded cardinality max_keys must be > 0")),
                 Some(_) => {}
+            }
+        }
+        if let Some(a) = &c.attach {
+            if !ATTACH_KINDS.contains(&a.as_str()) {
+                errs.push(format!(
+                    "{where_}: attach '{a}' unknown (want one of {})",
+                    ATTACH_KINDS.join(", ")
+                ));
             }
         }
         if c.attach.as_deref() == Some("uprobe") && c.hot_path {
@@ -425,6 +440,50 @@ tenancy: whatever
         let errs = validate(&def).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("gate.mode")));
         assert!(errs.iter().any(|e| e.contains("tenancy")));
+    }
+
+    #[test]
+    fn unknown_attach_kind_is_rejected() {
+        // A typo like `uprob` must be rejected, not silently skip the hot-path
+        // check by failing the `== "uprobe"` comparison.
+        let yaml = r#"
+apiVersion: assayist/v0
+name: bad
+target: { adapter: x }
+workload: { driver: y }
+gate: { mode: ab_permutation }
+capture:
+  - probe: p
+    attach: uprob
+    hot_path: true
+    cardinality: { class: singleton }
+tenancy: single_tenant
+"#;
+        let (def, _) = parse(yaml).unwrap();
+        let errs = validate(&def).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("attach 'uprob' unknown")));
+    }
+
+    #[test]
+    fn known_attach_kinds_are_accepted() {
+        for kind in ["tp_btf", "tracepoint", "fentry", "kprobe", "uprobe", "tc"] {
+            let yaml = format!(
+                r#"
+apiVersion: assayist/v0
+name: ok
+target: {{ adapter: x }}
+workload: {{ driver: y }}
+gate: {{ mode: ab_permutation }}
+capture:
+  - probe: p
+    attach: {kind}
+    cardinality: {{ class: singleton }}
+tenancy: single_tenant
+"#
+            );
+            let (def, _) = parse(&yaml).unwrap();
+            validate(&def).unwrap_or_else(|e| panic!("attach {kind} should validate: {e:?}"));
+        }
     }
 
     #[test]

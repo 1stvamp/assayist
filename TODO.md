@@ -16,10 +16,11 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
   `{"vcpu0":0,"vcpu1":1}`. Still open: the `vcpu n -> cpu n` policy is naive and
   honestly fails the run when the host lacks CPU `n` (a 1-CPU host cannot pin
   vcpu1); a NUMA-aware / isolcpus-aware policy is future work.
-- [ ] **Fingerprint is read once and reused across all runs.** `run` builds the
-  fingerprint once (apply-or-observe) and clones it into every assembled run. Fine
-  while the host is static; re-read per run so prep state that drifts between the A
-  and B SUT builds is caught.
+- [x] **Fingerprint is re-read per run.** `run` applies prep once (if
+  `--apply-prep`) and keeps the fail-fast consistency check up front, then
+  re-observes the host (read-only) for each assembled run, so drift between the A
+  and B builds surfaces in that run's own fingerprint instead of being masked by a
+  single snapshot. Pinning layout is folded in on top per run.
 - [x] **Native adapters validated on a real host.** `native.rs` (firecracker
   target + fio workload) ran end-to-end in a nested-KVM Incus VM (Ubuntu 24.04,
   kernel 6.8): booted real Firecracker microVMs, fio produced real reports
@@ -37,16 +38,20 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
   ULID layout (48-bit ms timestamp high, 80-bit entropy low), hex-encoded, so it is
   time-ordered and a valid OTLP `trace_id`. It is not the Crockford base32 ULID
   *string*; add that spelling only if a consumer needs it.
-- [ ] **Adapter/workload versions are placeholders.** `AdapterVersions::default`
-  is `0.0.0`. Real versions come from the running adapters in stage 4; the capture
-  subcommand stamps the placeholder until then.
+- [x] **Adapter/workload versions come from the adapters.** Both `run` and
+  `capture` now stamp the real `target.version()`/`workload.version()` (a
+  `--version` query for the native adapters, the `version` phase for the command
+  adapter). `AdapterVersions::default` (`0.0.0`) remains only as a test fixture.
 
 ## Deferred scope (orchestrator stage 1)
 
-- [ ] **Uprobe-on-hot-path load check is partial.** The load-time rejection of a
-  uprobe on a hot path needs attach-kind + hot-path info per capture entry. The
-  current `examples/firecracker-boot-snapshot.assay.yaml` carries only
-  `probe` + `gadget` + `cardinality`, no `attach`. Stage 1 validates it only when an
-  optional `attach`/`hot_path` is present on the entry. Decide whether attach-kind
-  belongs in the def (author-declared) or is discovered from the gadget at capture
-  time, and finish the check accordingly.
+- [x] **Uprobe-on-hot-path check finished; attach-kind is author-declared.**
+  Decision: attach kind lives in the def, not discovered from the gadget (the
+  orchestrator does not run a gadget to introspect it, and load-time rejection
+  must work off static data). A declared `attach` is now validated against the
+  contract's `attach_kind` vocabulary, so a typo (`uprob`) is rejected rather than
+  silently slipping past the `== "uprobe"` hot-path check. Fixed the stale enum in
+  `docs/contract-v0.md` (was missing `tracepoint`/`tc`). Residual: an entry that
+  omits `attach` still can't be hot-path-checked; that is inherent to
+  author-declaration, and the honest answer is the author must declare `attach`
+  for hot-path probes.

@@ -435,14 +435,17 @@ fn capture_cmd(args: &[String]) -> ExitCode {
         }
     };
 
-    let identity = run::build_identity(
-        &def,
-        params,
-        params_hash,
-        &sha,
-        &ca.sut_sha,
-        &run::AdapterVersions::default(),
-    );
+    // Real adapter/workload versions from the tools themselves (a `--version`
+    // query, no provisioning), rather than the 0.0.0 placeholder.
+    let shell = adapter::SystemShell;
+    let vars = adapter::vars(&params, &ca.sut_sha);
+    let target = select_target(&def, vars.clone(), prep.pin_threads);
+    let workload = select_workload(&def, vars);
+    let versions = run::AdapterVersions {
+        target: target.version(&shell),
+        workload: workload.version(&shell),
+    };
+    let identity = run::build_identity(&def, params, params_hash, &sha, &ca.sut_sha, &versions);
     let gate = run::build_gate_context(&def, "");
     let assay = run::assemble(run::new_run_id(), identity, fingerprint, gate, &fragments, vec![]);
 
@@ -624,10 +627,19 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     &versions,
                 );
                 let gate_ctx = run::build_gate_context(&def, "");
-                // Per-run fingerprint: the tuning/facts are shared, but the
-                // thread-pinning layout is this run's own, so a fully-prepped and
-                // pinned run can grade `reproducible`.
-                let mut fp = fingerprint.clone();
+                // Re-read the fingerprint per run (read-only; prep, if any, was
+                // applied once before the loop). A host that drifts between the A
+                // and B builds then shows up in that run's own fingerprint rather
+                // than being masked by a single snapshot taken up front. The
+                // thread-pinning layout is this run's own, folded in on top, so a
+                // fully-prepped and pinned run can grade `reproducible`.
+                let mut fp = match hostprep::observe(&host, &prep, &def.tenancy) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("re-reading fingerprint for {group}[cell {ci} #{i}]: {e}");
+                        return ExitCode::from(1);
+                    }
+                };
                 if let Some(layout) = target.pinning_layout() {
                     fp.pinning_layout = Some(layout);
                 }
