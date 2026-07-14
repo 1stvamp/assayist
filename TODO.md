@@ -16,15 +16,16 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
   fingerprint once (apply-or-observe) and clones it into every assembled run. Fine
   while the host is static; re-read per run so prep state that drifts between the A
   and B SUT builds is caught.
-- [ ] **Native adapters are unexercised against a real host.** `native.rs` ships
-  a firecracker target (curl over the api-sock: cold-boot `boot.api_to_init`,
-  restore `restore.resume_to_steady`, steady-state `snapshot.create`) and an fio
-  workload (fio CLI, JSON report). Both are unit-tested against a fake shell only;
-  neither has run against real firecracker/fio yet (needs a KVM host). The
-  `boot.api_to_init` span times the InstanceStart API round-trip, not the guest
-  reaching init: honest guest-init timing needs an in-guest signal the agentless
-  vantage deliberately does not have. Validate on a KVM host, then decide whether
-  a coarse boot span is worth keeping or should be dropped.
+- [x] **Native adapters validated on a real host.** `native.rs` (firecracker
+  target + fio workload) ran end-to-end in a nested-KVM Incus VM (Ubuntu 24.04,
+  kernel 6.8): booted real Firecracker microVMs, fio produced real reports
+  (fio-3.36), runs assembled and the gate returned a verdict. Two bugs found and
+  fixed by running it: the kvm gadget was missing `use std::os::fd::AsFd` (would
+  never build), and the firecracker teardown used `pkill -f -- "--api-sock ..."`
+  which self-matched and SIGTERM'd its own shell (now kills by a pidfile). Still
+  open: the `boot.api_to_init` span times the InstanceStart API round-trip, not
+  the guest reaching init (the agentless vantage cannot see guest-init); decide
+  whether that coarse span earns its keep.
 
 ## Deferred scope (orchestrator stage 3)
 
