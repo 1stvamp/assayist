@@ -25,10 +25,6 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 
 ## Deferred scope (orchestrator stage 3)
 
-- [ ] **Per-gadget cardinality flags not mapped.** `plan_gadgets` passes only
-  `--duration` and `--out`. A bounded capture entry (e.g. the kvm gadget's
-  per-guest mode) should translate to that gadget's flags (`--per-guest`,
-  `--max-keys N`), but the mapping is gadget-specific and not wired yet.
 - [ ] **`run_id` is not a canonical ULID.** `run::new_run_id` returns a 128-bit
   hex string derived from time + pid, unique enough for v0 and maps to an OTLP
   `trace_id`, but it is not lexicographically time-ordered. Switch to a real ULID

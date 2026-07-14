@@ -93,6 +93,12 @@ pub struct CaptureEntry {
     pub attach: Option<String>,
     #[serde(default)]
     pub hot_path: bool,
+    /// Extra gadget flags, passed verbatim after `--duration`/`--out`. Gadget
+    /// CLIs differ (kvm `--per-guest --max-keys`, net `--iface`, ctrlplane
+    /// `--cgroup`), so the author declares them here rather than the orchestrator
+    /// inferring gadget-specific flags from the cardinality decl.
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
