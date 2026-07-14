@@ -40,12 +40,15 @@ fn select_target(def: &BenchmarkDef, vars: BTreeMap<String, String>, pin_threads
     }
 }
 
-/// Pick a workload driver by name. `fio` / `fio-*` is the native adapter;
+/// Pick a workload driver by name. `fio*` and `wrk*` are native adapters;
 /// anything else falls back to the command adapter.
 fn select_workload(def: &BenchmarkDef, vars: BTreeMap<String, String>) -> Box<dyn Workload> {
     match def.workload.driver.as_str() {
         d if d == "fio" || d.starts_with("fio-") => {
             Box::new(native::fio_workload(&def.workload.config, &vars))
+        }
+        d if d == "wrk" || d.starts_with("wrk") => {
+            Box::new(native::wrk_workload(&def.workload.config, &vars))
         }
         _ => Box::new(adapter::command_workload(def, vars)),
     }
