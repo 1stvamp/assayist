@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trigger.dev/assayist/schema/v0/assay-run.json",
+  "title": "AssayRun",
+  "description": "One benchmark run. See assayist-contract-v0.md for normative prose.",
+  "type": "object",
+  "required": ["schema_version", "run_id", "identity", "fingerprint", "gate", "grade"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^0\\.[0-9]+\\.[0-9]+$",
+      "description": "Semver. External users pin to the major."
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "ULID, 128-bit. Maps to an OTLP trace_id on export."
+    },
+    "grade": {
+      "type": "string",
+      "enum": ["reproducible", "valid", "invalid"],
+      "description": "Derived at parse. Only 'reproducible' enters gated baselines."
+    },
+    "identity": { "$ref": "#/$defs/RunIdentity" },
+    "fingerprint": { "$ref": "#/$defs/HostFingerprint" },
+    "spans": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/LifecycleSpan" }
+    },
+    "series": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/MetricSeries" }
+    },
+    "self_metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ProbeCost" }
+    },
+    "gate": { "$ref": "#/$defs/GateContext" },
+    "outcome": { "$ref": "#/$defs/Outcome" }
+  },
+  "$defs": {
+    "Scalar": {
+      "type": ["string", "number", "integer", "boolean"]
+    },
+    "RunIdentity": {
+      "type": "object",
+      "required": [
+        "target_adapter", "target_adapter_version",
+        "workload_driver", "workload_driver_version",
+        "sut_git_sha", "params", "params_hash", "benchmark_def_sha"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target_adapter": { "type": "string" },
+        "target_adapter_version": { "type": "string" },
+        "workload_driver": { "type": "string" },
+        "workload_driver_version": { "type": "string" },
+        "sut_git_sha": { "type": "string", "minLength": 7 },
+        "params": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Scalar" }
+        },
+        "params_hash": { "type": "string" },
+        "benchmark_def_sha": { "type": "string" },
+        "source": {
+          "type": "string",
+          "enum": ["captured", "imported"],
+          "default": "captured",
+          "description": "'imported' set by the OTLP import plugin; forces grade <= valid."
+        }
+      }
+    },
+    "HostFingerprint": {
+      "type": "object",
+      "description": "Core fields required; extended fields lift grade to 'reproducible'.",
+      "required": [
+        "hostname", "kernel_version", "os_release", "cpu_model",
+        "cpu_count_logical", "cpu_count_physical", "smt_enabled",
+        "cpu_governor", "thp_setting", "total_memory_bytes",
+        "kvm_present", "tenancy", "tuning_requested", "tuning_readback"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "hostname": { "type": "string" },
+        "kernel_version": { "type": "string" },
+        "os_release": { "type": "string" },
+        "cpu_model": { "type": "string" },
+        "cpu_count_logical": { "type": "integer", "minimum": 1 },
+        "cpu_count_physical": { "type": "integer", "minimum": 1 },
+        "smt_enabled": { "type": "boolean" },
+        "cpu_governor": { "type": "string" },
+        "thp_setting": { "type": "string", "enum": ["always", "madvise", "never"] },
+        "total_memory_bytes": { "type": "integer", "minimum": 0 },
+        "kvm_present": { "type": "boolean" },
+        "tenancy": { "type": "string", "enum": ["single_tenant", "density"] },
+        "tuning_requested": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Scalar" }
+        },
+        "tuning_readback": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Scalar" }
+        },
+        "numa_topology": { "type": "object" },
+        "pinning_layout": { "type": "object" },
+        "mitigations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "microcode_version": { "type": "string" },
+        "nested_virt": { "type": "boolean" }
+      }
+    },
+    "LifecycleSpan": {
+      "type": "object",
+      "required": ["name", "start_unix_nano", "end_unix_nano"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "start_unix_nano": { "type": "integer", "minimum": 0 },
+        "end_unix_nano": { "type": "integer", "minimum": 0 },
+        "parent": { "type": "string" },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Scalar" }
+        }
+      }
+    },
+    "CardinalityDecl": {
+      "type": "object",
+      "required": ["class"],
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": ["singleton", "bounded"],
+          "description": "No 'unbounded' exists, on purpose."
+        },
+        "key_source": {
+          "type": "string",
+          "enum": ["vcpu_pid_map", "cgroup_id", "guest_index", "device", "netdev"]
+        },
+        "max_keys": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "class": { "const": "bounded" } } },
+          "then": { "required": ["key_source", "max_keys"] }
+        }
+      ]
+    },
+    "MetricSeries": {
+      "type": "object",
+      "required": ["name", "unit", "kind", "source", "cardinality", "data"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "unit": {
+          "type": "string",
+          "description": "UCUM, e.g. ns, us, By, 1."
+        },
+        "kind": { "type": "string", "enum": ["histogram", "counter", "gauge"] },
+        "source": {
+          "type": "string",
+          "description": "Probe id; MUST match a ProbeCost.probe_id when eBPF-sourced."
+        },
+        "key": { "type": "string" },
+        "cardinality_overflow": { "type": "boolean", "default": false },
+        "cardinality": { "$ref": "#/$defs/CardinalityDecl" },
+        "data": {
+          "oneOf": [
+            { "$ref": "#/$defs/HistogramData" },
+            { "$ref": "#/$defs/CounterData" },
+            { "$ref": "#/$defs/GaugeData" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "histogram" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/HistogramData" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "counter" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/CounterData" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "gauge" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/GaugeData" } } }
+        }
+      ]
+    },
+    "HistogramData": {
+      "type": "object",
+      "required": ["layout", "buckets", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "layout": { "type": "string", "enum": ["log2", "explicit"] },
+        "buckets": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "explicit_bounds": {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        "sum": { "type": "number" },
+        "count": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "layout": { "const": "explicit" } } },
+          "then": { "required": ["explicit_bounds"] }
+        }
+      ]
+    },
+    "CounterData": {
+      "type": "object",
+      "required": ["value", "start_unix_nano"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "integer", "minimum": 0 },
+        "start_unix_nano": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "GaugeData": {
+      "type": "object",
+      "required": ["value", "time_unix_nano"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "number" },
+        "time_unix_nano": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ProbeCost": {
+      "type": "object",
+      "required": [
+        "probe_id", "attach_kind", "run_time_ns", "run_cnt",
+        "mean_ns", "steady_cpu_fraction", "over_budget"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "probe_id": { "type": "string" },
+        "attach_kind": {
+          "type": "string",
+          "enum": ["tp_btf", "tracepoint", "fentry", "fexit", "kprobe", "kretprobe", "uprobe", "xdp", "tc"]
+        },
+        "run_time_ns": { "type": "integer", "minimum": 0 },
+        "run_cnt": { "type": "integer", "minimum": 0 },
+        "mean_ns": { "type": "number", "minimum": 0 },
+        "steady_cpu_fraction": { "type": "number", "minimum": 0 },
+        "over_budget": { "type": "boolean" },
+        "hot_path": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true and attach_kind is uprobe, the loader MUST reject."
+        }
+      }
+    },
+    "GateContext": {
+      "type": "object",
+      "required": ["mode", "baseline_ref", "p_threshold", "noise_threshold", "resamples", "tenancy"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["ab_permutation", "longitudinal_drift", "subsystem_triad"]
+        },
+        "baseline_ref": { "type": "string" },
+        "p_threshold": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.01 },
+        "noise_threshold": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.05 },
+        "resamples": { "type": "integer", "minimum": 1, "default": 10000 },
+        "ignore": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "tenancy": { "type": "string", "enum": ["single_tenant", "density"] }
+      }
+    },
+    "Outcome": {
+      "type": "object",
+      "required": ["verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "verdict": { "type": "string", "enum": ["pass", "fail", "contaminated"] },
+        "per_metric": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["delta", "p", "significant", "noisy"],
+            "additionalProperties": false,
+            "properties": {
+              "delta": { "type": "number" },
+              "p": { "type": "number", "minimum": 0, "maximum": 1 },
+              "significant": { "type": "boolean" },
+              "noisy": { "type": "boolean" }
+            }
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

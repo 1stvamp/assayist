@@ -1,0 +1,21 @@
+[package]
+name = "assayist-capture-net"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Host-side tap/virtio-net capture for Assayist"
+
+[[bin]]
+name = "assayist-capture-net"
+path = "src/main.rs"
+
+[dependencies]
+libbpf-rs = "0.24"
+libbpf-sys = "1.4"
+libc = "0.2"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[build-dependencies]
+libbpf-cargo = "0.24"

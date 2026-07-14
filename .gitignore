@@ -1,0 +1,12 @@
+/target
+**/target
+Cargo.lock
+capture/*/src/bpf/vmlinux.h
+*.skel.rs
+
+# orchestrator output
+/assayist-out
+
+# local agent scratch (do not commit)
+/.claude/settings.local.json
+/.remember/

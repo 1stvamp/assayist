@@ -1,0 +1,31 @@
+# A benchmark definition. Committed next to the code under test; its hash
+# becomes identity.benchmark_def_sha in every AssayRun it produces.
+apiVersion: assayist/v0
+name: firecracker-boot-snapshot
+target:
+  adapter: firecracker
+  version: ">=0.3"
+workload:
+  driver: fio-libaio
+gate:
+  mode: ab_permutation
+  p_threshold: 0.01
+  noise_threshold: 0.05
+  resamples: 10000
+  ignore: []
+parameterise:
+  vcpu: [1, 2, 4]
+  mem_mib: [256, 512]
+capture:
+  - probe: kvm_exit
+    gadget: assayist-capture-kvm
+    cardinality: { class: singleton }
+  - probe: block_rq_complete
+    gadget: assayist-capture-block
+    cardinality: { class: bounded, key_source: device, max_keys: 256 }
+host_prep:
+  cpu_governor: performance
+  smt: off
+  thp: never
+  pin_threads: true
+tenancy: single_tenant
