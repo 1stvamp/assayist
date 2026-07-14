@@ -33,8 +33,9 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `capture/block` (block-IO latency per device) | written, needs a BTF host |
 | `capture/net` (tap/virtio-net counters + size histograms) | written, needs a BTF host |
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | written, needs a BTF host |
-| OTLP import/export plugin | designed (see `docs/contract-v0.md`), not yet built |
-| `crates/orchestrate` (run defs -> capture -> assemble -> gate) | stub, next up |
+| OTLP export (`crates/otlp`) | built, tested; wired as `assayist export` |
+| OTLP import | designed (see `docs/contract-v0.md`), not yet built |
+| `crates/orchestrate` (run defs -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export` |
 | reference target/workload adapters | not yet started |
 
 The gate is the only piece verified by execution here; the gadgets are written to be correct but need a BTF-enabled Linux host with clang and bpftool to build and run.

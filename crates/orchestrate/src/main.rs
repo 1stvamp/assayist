@@ -33,6 +33,8 @@ fn usage() -> ExitCode {
     eprintln!("      fire the def's capture gadgets once and assemble one graded AssayRun.");
     eprintln!("  assayist inspect <def.yaml>");
     eprintln!("      parse, validate, expand a def and observe the host (read-only).");
+    eprintln!("  assayist export <run.json> [--signal both|traces|metrics] [--out PATH]");
+    eprintln!("      transform an assembled AssayRun into OTLP/JSON.");
     ExitCode::from(64) // EX_USAGE
 }
 
@@ -45,8 +47,99 @@ fn main() -> ExitCode {
             Some(path) => inspect(path),
             None => usage(),
         },
+        Some("export") => export_cmd(&args[1..]),
         _ => usage(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// export: AssayRun JSON -> OTLP/JSON.
+// ---------------------------------------------------------------------------
+
+fn export_cmd(args: &[String]) -> ExitCode {
+    let mut run_path: Option<String> = None;
+    let mut signal = "both".to_string();
+    let mut out = "-".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let mut next = || {
+            i += 1;
+            args.get(i).cloned().ok_or_else(|| format!("missing value after {arg}"))
+        };
+        match arg.as_str() {
+            "--signal" => match next() {
+                Ok(s) => signal = s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return usage();
+                }
+            },
+            "--out" => match next() {
+                Ok(s) => out = s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return usage();
+                }
+            },
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag {other}");
+                return usage();
+            }
+            other => {
+                if run_path.is_some() {
+                    eprintln!("unexpected argument {other}");
+                    return usage();
+                }
+                run_path = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = run_path else {
+        eprintln!("export needs a <run.json> path");
+        return usage();
+    };
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("reading {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let run: assayist_contract::AssayRun = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("parsing AssayRun from {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let doc = match signal.as_str() {
+        "both" => assayist_otlp::export(&run),
+        "traces" => assayist_otlp::export_traces(&run),
+        "metrics" => assayist_otlp::export_metrics(&run),
+        other => {
+            eprintln!("unknown --signal '{other}' (want both, traces, or metrics)");
+            return usage();
+        }
+    };
+
+    let json = match serde_json::to_string_pretty(&doc) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("serialising OTLP: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if out == "-" {
+        println!("{json}");
+    } else if let Err(e) = std::fs::write(&out, json) {
+        eprintln!("writing {out}: {e}");
+        return ExitCode::from(1);
+    }
+    ExitCode::from(0)
 }
 
 // ---------------------------------------------------------------------------
