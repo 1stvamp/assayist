@@ -27,12 +27,17 @@ use assayist_contract::Grade;
 
 fn usage() -> ExitCode {
     eprintln!("usage:");
-    eprintln!("  assayist run <def.yaml> [--repeat N] [--a-sut SHA] [--b-sut SHA] [--out DIR] [--duration N] [--allow-ungraded]");
+    eprintln!("  assayist run <def.yaml> [--repeat N] [--a-sut SHA] [--b-sut SHA] [--out DIR] [--duration N] [--allow-ungraded] [--apply-prep]");
     eprintln!("      full A/B pipeline: capture N runs per group per cell, assemble, and gate.");
+    eprintln!("      --apply-prep writes host tuning to sysfs (needs root); default observes read-only.");
     eprintln!("  assayist capture <def.yaml> [--duration N] [--out PATH] [--sut-sha SHA] [--work-dir DIR]");
     eprintln!("      fire the def's capture gadgets once and assemble one graded AssayRun.");
     eprintln!("  assayist inspect <def.yaml>");
     eprintln!("      parse, validate, expand a def and observe the host (read-only).");
+    eprintln!("  assayist export <run.json> [--signal both|traces|metrics] [--out PATH]");
+    eprintln!("      transform an assembled AssayRun into OTLP/JSON.");
+    eprintln!("  assayist import <otlp.json> [--out PATH]");
+    eprintln!("      transform an OTLP/JSON document into an AssayRun (grade: valid).");
     ExitCode::from(64) // EX_USAGE
 }
 
@@ -45,8 +50,184 @@ fn main() -> ExitCode {
             Some(path) => inspect(path),
             None => usage(),
         },
+        Some("export") => export_cmd(&args[1..]),
+        Some("import") => import_cmd(&args[1..]),
         _ => usage(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// export: AssayRun JSON -> OTLP/JSON.
+// ---------------------------------------------------------------------------
+
+fn export_cmd(args: &[String]) -> ExitCode {
+    let mut run_path: Option<String> = None;
+    let mut signal = "both".to_string();
+    let mut out = "-".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let mut next = || {
+            i += 1;
+            args.get(i).cloned().ok_or_else(|| format!("missing value after {arg}"))
+        };
+        match arg.as_str() {
+            "--signal" => match next() {
+                Ok(s) => signal = s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return usage();
+                }
+            },
+            "--out" => match next() {
+                Ok(s) => out = s,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return usage();
+                }
+            },
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag {other}");
+                return usage();
+            }
+            other => {
+                if run_path.is_some() {
+                    eprintln!("unexpected argument {other}");
+                    return usage();
+                }
+                run_path = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = run_path else {
+        eprintln!("export needs a <run.json> path");
+        return usage();
+    };
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("reading {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let run: assayist_contract::AssayRun = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("parsing AssayRun from {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Histograms and probe-cost points carry no timestamp in the contract, so
+    // stamp export time onto them.
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let doc = match signal.as_str() {
+        "both" => assayist_otlp::export_at(&run, now_nanos),
+        "traces" => assayist_otlp::export_traces(&run),
+        "metrics" => assayist_otlp::export_metrics_at(&run, now_nanos),
+        other => {
+            eprintln!("unknown --signal '{other}' (want both, traces, or metrics)");
+            return usage();
+        }
+    };
+
+    let json = match serde_json::to_string_pretty(&doc) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("serialising OTLP: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if out == "-" {
+        println!("{json}");
+    } else if let Err(e) = std::fs::write(&out, json) {
+        eprintln!("writing {out}: {e}");
+        return ExitCode::from(1);
+    }
+    ExitCode::from(0)
+}
+
+// ---------------------------------------------------------------------------
+// import: OTLP/JSON -> AssayRun JSON.
+// ---------------------------------------------------------------------------
+
+fn import_cmd(args: &[String]) -> ExitCode {
+    let mut in_path: Option<String> = None;
+    let mut out = "-".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out = v.clone(),
+                    None => {
+                        eprintln!("missing value after --out");
+                        return usage();
+                    }
+                }
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag {other}");
+                return usage();
+            }
+            other => {
+                if in_path.is_some() {
+                    eprintln!("unexpected argument {other}");
+                    return usage();
+                }
+                in_path = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = in_path else {
+        eprintln!("import needs an <otlp.json> path");
+        return usage();
+    };
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("reading {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("parsing OTLP from {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let run = match assayist_otlp::import(&doc) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("importing OTLP: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let json = match serde_json::to_string_pretty(&run) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("serialising run: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if out == "-" {
+        println!("{json}");
+    } else if let Err(e) = std::fs::write(&out, json) {
+        eprintln!("writing {out}: {e}");
+        return ExitCode::from(1);
+    }
+    ExitCode::from(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +450,7 @@ struct RunArgs {
     out_dir: PathBuf,
     duration: u64,
     allow_ungraded: bool,
+    apply_prep: bool,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -281,6 +463,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         out_dir: PathBuf::from("assayist-out"),
         duration: 30,
         allow_ungraded: false,
+        apply_prep: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -296,6 +479,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--out" => ra.out_dir = PathBuf::from(next()?),
             "--duration" => ra.duration = next()?.parse().map_err(|_| "bad --duration")?,
             "--allow-ungraded" => ra.allow_ungraded = true,
+            "--apply-prep" => ra.apply_prep = true,
             other if other.starts_with("--") => return Err(format!("unknown flag {other}")),
             other => {
                 if def_path.is_some() {
@@ -329,19 +513,35 @@ fn run_cmd(args: &[String]) -> ExitCode {
 
     let cells = def::expand_cells(&def);
     let prep = hostprep::HostPrep::from_value(&def.host_prep);
-    if prep.knobs.to_value() != serde_json::json!({}) {
+    let host = hostprep::LinuxHost::new();
+    let has_knobs = prep.knobs.to_value() != serde_json::json!({});
+    if has_knobs && !ra.apply_prep {
         eprintln!(
-            "note: host prep is not applied yet (observe-only). requested tuning {} is recorded but not enforced, so runs may grade `invalid` if the host does not already match. see TODO.md.",
+            "note: --apply-prep not set, so host prep is observed not applied. requested tuning {} is recorded but not enforced; runs grade `invalid` if the host does not already match.",
             prep.knobs.to_value()
         );
     }
-    let fingerprint = match hostprep::observe(&hostprep::LinuxHost::new(), &prep, &def.tenancy) {
+    // Apply host prep (mutates sysfs, needs root) only when asked; otherwise
+    // observe the current state read-only.
+    let fp_result = if ra.apply_prep {
+        hostprep::prepare(&host, &prep, &def.tenancy)
+    } else {
+        hostprep::observe(&host, &prep, &def.tenancy)
+    };
+    let fingerprint = match fp_result {
         Ok(fp) => fp,
         Err(e) => {
             eprintln!("cannot build fingerprint: {e}");
             return ExitCode::from(1);
         }
     };
+    if ra.apply_prep && !fingerprint.tuning_consistent() {
+        eprintln!(
+            "host prep did not take: requested {} but host reports {}. refusing the run.",
+            fingerprint.tuning_requested, fingerprint.tuning_readback
+        );
+        return ExitCode::from(1);
+    }
 
     if let Err(e) = std::fs::create_dir_all(&ra.out_dir) {
         eprintln!("creating out dir {}: {e}", ra.out_dir.display());
@@ -398,7 +598,7 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     &versions,
                 );
                 let gate_ctx = run::build_gate_context(&def, "");
-                let assay = run::assemble(
+                let mut assay = run::assemble(
                     run::new_run_id(),
                     identity,
                     fingerprint.clone(),
@@ -406,6 +606,9 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     &art.fragments,
                     art.spans,
                 );
+                if !art.workload_report.is_null() {
+                    assay.workload_report = Some(art.workload_report);
+                }
 
                 let path = ra.out_dir.join(format!("{group}_{ci}_{i}.json"));
                 let json = match serde_json::to_string_pretty(&assay) {

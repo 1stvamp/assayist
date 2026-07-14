@@ -104,9 +104,8 @@ pub trait Host {
     /// Read back only the knobs the request set, so shapes line up for the
     /// consistency check.
     fn read_tuning(&self, want: &TuningKnobs) -> Result<TuningKnobs, String>;
-    /// Mutating: write governor/SMT/THP to sysfs. Needs root. Never called from
-    /// a read-only path. Consumed by the run-loop stage.
-    #[allow(dead_code)]
+    /// Mutating: write governor/SMT/THP to sysfs. Needs root. Only called on the
+    /// apply path (`assayist run --apply-prep`), never from a read-only one.
     fn apply_tuning(&self, want: &TuningKnobs) -> Result<(), String>;
 }
 
@@ -153,9 +152,8 @@ pub fn observe(host: &dyn Host, prep: &HostPrep, tenancy: &str) -> Result<Finger
 
 /// Mutating: apply the requested tuning, read it back, and build the fingerprint.
 /// The caller must check `tuning_consistent()` before admitting a gated run.
-/// Not exercised on the dev host (needs root); the pipeline stage that repeats
-/// runs will call this. Kept out of the read-only demo path on purpose.
-#[allow(dead_code)] // wired in the run-loop stage
+/// Needs root (writes sysfs). Called by `assayist run --apply-prep`. The caller
+/// must check `tuning_consistent()` before admitting a gated run.
 pub fn prepare(host: &dyn Host, prep: &HostPrep, tenancy: &str) -> Result<Fingerprint, String> {
     host.apply_tuning(&prep.knobs)?;
     let facts = host.facts()?;
@@ -246,12 +244,56 @@ impl Host for LinuxHost {
     }
 
     fn apply_tuning(&self, want: &TuningKnobs) -> Result<(), String> {
-        // Mutating sysfs writes; needs root. Left unimplemented here so no path
-        // accidentally reconfigures a host: the run loop that needs it will
-        // implement the writes with the appropriate guards.
-        let _ = want;
-        Err("apply_tuning not yet implemented (needs root; wired with the run loop)".into())
+        if let Some(gov) = &want.cpu_governor {
+            set_governor(gov)?;
+        }
+        if let Some(smt) = &want.smt {
+            set_smt(*smt)?;
+        }
+        if let Some(thp) = &want.thp {
+            write_sysfs("/sys/kernel/mm/transparent_hugepage/enabled", thp)?;
+        }
+        Ok(())
     }
+}
+
+fn write_sysfs(path: &str, value: &str) -> Result<(), String> {
+    std::fs::write(path, value).map_err(|e| format!("writing '{value}' to {path}: {e}"))
+}
+
+/// Write the governor to every online CPU's cpufreq node. A host with no cpufreq
+/// (common in VMs) has no `scaling_governor` files, so requesting a governor
+/// there is an error: the run cannot claim the tuning took.
+fn set_governor(gov: &str) -> Result<(), String> {
+    let mut wrote = 0;
+    let dir = std::fs::read_dir("/sys/devices/system/cpu").map_err(|e| format!("listing cpus: {e}"))?;
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_cpu_n = name
+            .strip_prefix("cpu")
+            .map(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false);
+        if !is_cpu_n {
+            continue;
+        }
+        let path = format!("/sys/devices/system/cpu/{name}/cpufreq/scaling_governor");
+        if std::path::Path::new(&path).exists() {
+            write_sysfs(&path, gov)?;
+            wrote += 1;
+        }
+    }
+    if wrote == 0 {
+        return Err("no cpufreq scaling_governor present; cannot set the CPU governor".into());
+    }
+    Ok(())
+}
+
+fn set_smt(on: bool) -> Result<(), String> {
+    let path = "/sys/devices/system/cpu/smt/control";
+    if !std::path::Path::new(path).exists() {
+        return Err("SMT control not available (/sys/devices/system/cpu/smt/control missing)".into());
+    }
+    write_sysfs(path, if on { "on" } else { "off" })
 }
 
 fn read_trim(path: &str) -> Option<String> {

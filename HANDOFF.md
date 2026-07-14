@@ -19,8 +19,8 @@ Verified by execution here: the `contract` crate and the `gate` (permutation A/B
 | Block gadget (per-device IO latency) | `capture/block` | written |
 | Net gadget (tap counters + size hist) | `capture/net` | written |
 | Ctrlplane gadget (runqueue latency, on-CPU) | `capture/ctrlplane` | written |
-| Orchestrator | `crates/orchestrate` | v0 complete: `run` (full A/B pipeline), `capture`, `inspect`. Host-prep apply pending (observe-only), native adapters pending |
-| OTLP import/export plugin | (design in contract-v0.md) | not built |
+| Orchestrator | `crates/orchestrate` | v0 complete: `run` (A/B pipeline, `--apply-prep` writes host tuning), `capture`, `inspect`, `export`/`import`. `pinning_layout` + native adapters pending |
+| OTLP export + import | `crates/otlp` | built, tested (round-trip); wired as `assayist export` / `assayist import` |
 | Reference target/workload adapters | `adapters/` | empty |
 
 ## Build and verify
@@ -50,7 +50,7 @@ Toolchain: builds on stable Rust (verified on 1.75). The gate depends only on `s
 
 Module map:
 - `def.rs` parse/validate/expand, `benchmark_def_sha`, per-cell `params_hash`. Load-rejects missing cardinality, unbounded, bounded-without-key, unknown gate mode/tenancy, uprobe-on-hot-path.
-- `hostprep.rs` `Fingerprint` behind a `Host` trait (`LinuxHost` reads `/proc`+`/sys`, fake for tests); requested-vs-readback tuning rule. `apply_tuning`/`prepare` exist but are unimplemented (needs root); `run` uses `observe()` for now, so runs grade at most `valid`.
+- `hostprep.rs` `Fingerprint` behind a `Host` trait (`LinuxHost` reads `/proc`+`/sys`, fake for tests); requested-vs-readback tuning rule. `apply_tuning` writes governor/SMT/THP to sysfs; `assayist run --apply-prep` applies (needs root) and refuses the run if readback != requested, else observes read-only. Verified against real sysfs in an Incus VM. Runs grade at most `valid` until `pinning_layout` is recorded (see TODO.md).
 - `capture.rs` `GadgetRunner` spawn/wait seam; `capture()` spawns all then waits all so gadgets share one window; `SubprocessRunner` real, fake for tests.
 - `adapter.rs` the SPI: `Target` (provision/start/reach_steady/spans/teardown) and `Workload` (start/stop/report) traits, a v0 command-adapter that runs shell templates from the def with `{param}` interpolation, and `execute_run` (spawn gadgets, run workload across the window, wait, wind down). `Shell` seam for tests.
 - `run.rs` builds `Identity` + gate context, calls `AssayRun::assemble`, mints run ids.
@@ -60,7 +60,7 @@ Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub g
 
 ## After the orchestrator
 
-1. OTLP import/export plugin (design in `docs/contract-v0.md`): export is a rote transform (run_id -> trace_id, log2 -> exponential scale 0, fingerprint -> resource attrs); import degrades to `grade: valid`.
+1. ~~OTLP export + import~~ done (`crates/otlp`, `assayist export` / `assayist import`). Export: run_id -> trace_id, spans with deterministic ids, log2 -> exponential scale 0, explicit -> histogram, counter -> sum, gauge -> gauge, self_metrics -> `assayist.probe.*`, fingerprint/identity -> resource attrs (semconv where it exists). Import degrades gracefully: fills spans + series + fingerprint core, no self_metrics, `identity.source = imported`, `grade: valid`. Round-trip tested.
 2. Reference adapters: `firecracker` target (boot/snapshot/restore spans), `fio` and `wrk` workloads.
 3. Finer histograms for tail gating: log2-derived p50/p99 are too coarse to gate on (see gate README); add an explicit/high-resolution histogram option for metrics whose tail you need to gate.
 4. Optional: refactor the gate to read via the `contract` crate types where it helps, but keep it liberal in what it accepts.
@@ -85,7 +85,7 @@ Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub g
 - Gadget userspace targets libbpf-rs 0.24; the prog-info call uses libbpf-sys directly. Expect minor API drift on other point releases. The tc-attach path in the net gadget is the most version-sensitive bit.
 - `name_to_handle_at` cgroup-id resolution (ctrlplane) assumes cgroup v2 kernfs handles; `--cgroup-id` is the escape hatch.
 - The two LICENSE files hold TODO placeholders for canonical text. Fill before publishing.
-- Contract enum additions so far (all additive on v0): `attach_kind` gained `tracepoint` and `tc`; `key_source` gained `device` and `netdev`. Keep additions additive.
+- Contract additions so far (all additive on v0): `attach_kind` gained `tracepoint` and `tc`; `key_source` gained `device` and `netdev`; `AssayRun` gained an optional `workload_report` (opaque provenance, no grading/gating effect). Keep additions additive.
 
 ## File map
 

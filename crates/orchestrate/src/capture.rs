@@ -61,18 +61,31 @@ pub trait GadgetRunner {
     type Handle;
     fn spawn(&self, inv: &GadgetInvocation) -> Result<Self::Handle, String>;
     fn wait(&self, inv: &GadgetInvocation, handle: Self::Handle) -> Result<Fragment, String>;
+    /// Abandon a spawned gadget without collecting it, used to clean up already
+    /// running gadgets when a later spawn fails. Default no-op.
+    fn kill(&self, _handle: Self::Handle) {}
 }
 
 /// Spawn every gadget, then collect every fragment. A failure to spawn or a
 /// non-zero exit fails the whole capture: a missing series means the assembled
-/// run cannot be trusted, so it is better to refuse than to grade a hole.
+/// run cannot be trusted, so it is better to refuse than to grade a hole. If a
+/// spawn fails midway, the gadgets already spawned are killed rather than left
+/// running.
 pub fn capture<R: GadgetRunner>(
     plan: &[GadgetInvocation],
     runner: &R,
 ) -> Result<Vec<Fragment>, String> {
     let mut handles = Vec::with_capacity(plan.len());
     for inv in plan {
-        handles.push(runner.spawn(inv)?);
+        match runner.spawn(inv) {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                for h in handles {
+                    runner.kill(h);
+                }
+                return Err(e);
+            }
+        }
     }
     let mut fragments = Vec::with_capacity(plan.len());
     for (inv, handle) in plan.iter().zip(handles) {
@@ -109,6 +122,11 @@ impl GadgetRunner for SubprocessRunner {
         })?;
         serde_json::from_str(&text)
             .map_err(|e| format!("parsing fragment from {} ({}): {e}", inv.probe, e))
+    }
+
+    fn kill(&self, mut child: Child) {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -214,5 +232,44 @@ mod tests {
         let runner = FakeRunner { by_probe: HashMap::new() };
         let plan = plan_gadgets(&[entry("kvm_exit", Some("g1"))], 10, Path::new("/tmp")).unwrap();
         assert!(capture(&plan, &runner).is_err());
+    }
+
+    #[test]
+    fn a_later_spawn_failure_kills_earlier_gadgets() {
+        use std::cell::RefCell;
+
+        struct KillFake {
+            fail_on: String,
+            killed: RefCell<Vec<String>>,
+        }
+        impl GadgetRunner for KillFake {
+            type Handle = String; // the probe name
+            fn spawn(&self, inv: &GadgetInvocation) -> Result<String, String> {
+                if inv.probe == self.fail_on {
+                    Err(format!("spawn {} boom", inv.probe))
+                } else {
+                    Ok(inv.probe.clone())
+                }
+            }
+            fn wait(&self, _inv: &GadgetInvocation, _h: String) -> Result<Fragment, String> {
+                Ok(Fragment::default())
+            }
+            fn kill(&self, h: String) {
+                self.killed.borrow_mut().push(h);
+            }
+        }
+
+        let runner = KillFake { fail_on: "c".into(), killed: RefCell::new(vec![]) };
+        let plan = plan_gadgets(
+            &[entry("a", Some("g")), entry("b", Some("g")), entry("c", Some("g"))],
+            10,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+
+        assert!(capture(&plan, &runner).is_err());
+        // a and b were spawned before c failed, so both get killed.
+        let killed = runner.killed.borrow();
+        assert_eq!(killed.as_slice(), &["a".to_string(), "b".to_string()]);
     }
 }

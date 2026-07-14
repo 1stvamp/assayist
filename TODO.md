@@ -5,36 +5,30 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 
 ## Deferred scope (orchestrator stages 4-5)
 
-- [ ] **Host prep is not applied, only observed.** `hostprep::apply_tuning` returns
-  an error (writing sysfs needs root), so `assayist run` uses `observe()`. Runs
-  grade at most `valid`, and if a def's `host_prep` requests tuning the host does
-  not already match, runs grade `invalid` (honest: prep did not take). Implement
-  the sysfs writes with the appropriate root/guard handling, then switch `run` to
-  `prepare()` and record `pinning_layout` so runs can reach `reproducible`.
-- [ ] **`workload_report` is captured but not stored.** `execute_run` collects the
-  workload driver's `report` output and the pipeline logs it, but the contract has
-  no field for it, so it is dropped from the `AssayRun`. Decide where it belongs
-  (a span attribute, a new optional field) or keep it out deliberately.
-- [ ] **Fingerprint is read once and reused across all runs.** `run` observes the
-  host once and clones the fingerprint into every assembled run. Fine while the
-  host is static, but re-read per run once prep-apply lands (prep state can differ
-  between the A and B SUT builds).
+- [ ] **`pinning_layout` is never recorded, so runs cannot reach `reproducible`.**
+  `apply_tuning` (governor/SMT/THP) is done and wired behind `assayist run
+  --apply-prep` (verified against real sysfs in an Incus VM: THP applies and the
+  run proceeds; a governor request on a host with no cpufreq is refused). But
+  `has_extended()` also needs `pinning_layout`, which nothing sets. Thread thread
+  pinning (the `pin_threads` directive) through the target adapter and record the
+  layout so a fully-prepped run can grade `reproducible` rather than `valid`.
+- [ ] **Fingerprint is read once and reused across all runs.** `run` builds the
+  fingerprint once (apply-or-observe) and clones it into every assembled run. Fine
+  while the host is static; re-read per run so prep state that drifts between the A
+  and B SUT builds is caught.
 - [ ] **Command adapters are the only adapter.** The `Target`/`Workload` traits are
   the SPI; only the shell command-adapter implements them. Real `firecracker`/`fio`
   adapters (native Rust, with genuine lifecycle spans and versions) come next.
 
 ## Deferred scope (orchestrator stage 3)
 
-- [ ] **`run_id` is not a canonical ULID.** `run::new_run_id` returns a 128-bit
-  hex string derived from time + pid, unique enough for v0 and maps to an OTLP
-  `trace_id`, but it is not lexicographically time-ordered. Switch to a real ULID
-  (dedicated crate) when it matters.
+- [ ] **`run_id` is not the canonical ULID text form.** `run::new_run_id` now uses
+  ULID layout (48-bit ms timestamp high, 80-bit entropy low), hex-encoded, so it is
+  time-ordered and a valid OTLP `trace_id`. It is not the Crockford base32 ULID
+  *string*; add that spelling only if a consumer needs it.
 - [ ] **Adapter/workload versions are placeholders.** `AdapterVersions::default`
   is `0.0.0`. Real versions come from the running adapters in stage 4; the capture
   subcommand stamps the placeholder until then.
-- [ ] **`capture` orphans spawned children on a later spawn failure.** If gadget 2
-  fails to spawn, gadget 1 is left running. Minor for v0 (spawn failures are fast,
-  before real work); tidy with a kill-on-error guard when it matters.
 
 ## Deferred scope (orchestrator stage 1)
 
