@@ -85,7 +85,7 @@ Verified end-to-end by `tests/pipeline.rs` (drives the real binary with a stub g
 - log2-derived p50/p99 are coarse (snap to bucket midpoints), so the noise gate usually excludes them. Gate on the mean (from the exact `sum` the gadgets emit); use finer histograms if you must gate a tail.
 - Gadget userspace targets libbpf-rs 0.24; the prog-info call uses libbpf-sys directly. Expect minor API drift on other point releases. The tc-attach path in the net gadget is the most version-sensitive bit.
 - `name_to_handle_at` cgroup-id resolution (ctrlplane) assumes cgroup v2 kernfs handles; `--cgroup-id` is the escape hatch.
-- The two LICENSE files hold TODO placeholders for canonical text. Fill before publishing.
+- The two LICENSE files carry the canonical Apache-2.0 and GPL-2.0 texts; the licence split is per-file via SPDX headers (userspace Apache-2.0, `capture/*/src/bpf/*.bpf.c` GPL-2.0).
 - Contract additions so far (all additive on v0): `attach_kind` gained `tracepoint` and `tc`; `key_source` gained `device` and `netdev`; `AssayRun` gained an optional `workload_report` (opaque provenance, no grading/gating effect). Keep additions additive.
 - Module tracepoint BTF: on kernels where KVM is a module (the common case), `trace_event_raw_kvm_exit` is in `/sys/kernel/btf/kvm`, not core vmlinux BTF. Generate the kvm gadget's `vmlinux.h` from the module BTF or the build fails with `incomplete definition of type`. See `capture/kvm/README.md`.
 - ProbeCost in nested virt: running the kvm gadget inside a nested-KVM VM cost ~1.2% steady CPU per probe (`over_budget: true`), so the gate correctly graded the run `contaminated`. That is the self-metrics guarantee working, not a bug; expect lower cost on bare metal, but always read `over_budget` before trusting a run.

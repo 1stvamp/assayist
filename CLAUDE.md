@@ -35,7 +35,7 @@ Project instructions for an agent working in this repo. Complements the global `
 ## Licence
 
 - Userspace: Apache-2.0. eBPF objects (`capture/*/src/bpf/*.bpf.c`): GPL-2.0 (tracing helpers require it). Per-file SPDX headers are authoritative. Keep them on every new file.
-- The two LICENSE files still hold TODO placeholders for canonical text; fill before publishing.
+- The two LICENSE files carry the canonical Apache-2.0 and GPL-2.0 texts (filled). Keep them verbatim; the split is expressed per-file via SPDX headers, not by editing the licence texts.
 
 ## Testing
 
