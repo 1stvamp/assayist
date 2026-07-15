@@ -1,2 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned (not "stable") so dev and CI resolve the same compiler and lints.
+# Keep in sync with mise.toml.
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
