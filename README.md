@@ -37,7 +37,7 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | written, needs a BTF host |
 | OTLP export + import (`crates/otlp`) | built, tested; wired as `assayist export` / `import` |
 | `crates/orchestrate` (run defs -> host prep -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export`/`import` |
-| native adapters: `firecracker` target, `fio` + `wrk` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk |
+| native adapters: `firecracker` target, `fio` + `wrk` + `vsock` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk, `vsock` drove a restored microVM's function server over its host vsock socket |
 
 Verified by execution: the core (contract, gate, OTLP round-trip), and the whole pipeline end-to-end on a nested-KVM host. The kvm gadget captured a live Firecracker microVM's exits, the firecracker/fio/wrk adapters drove real runs, and a fully-prepped, vCPU-pinned run graded `reproducible`. The block gadget captured per-device I/O latency over a cold snapshot restore in the same run as the kvm gadget. The net/ctrlplane gadgets are written but not yet run: they each need a BTF-enabled Linux host with clang and bpftool.
 
@@ -165,6 +165,24 @@ target:
 ```
 
 The variant is substituted into config templates as `{variant}` and recorded in each run's `params`. Any other `parameterise` dimensions form cells within each group. Config templates also expand `{def_dir}` (the directory of the def file), so a committed def references its assets by repo-relative path rather than a machine-specific absolute one. The `pre_restore` config key runs a shell command before the timed `snapshot/load` (outside the span), which is how a def sets the page-cache state a restore starts from: drop caches for a cold baseline, or warm a working set so resume faults hit cache.
+
+### Driving an agentless guest
+
+An idle guest only shows host background traffic in the capture window. The `vsock` workload driver exercises it: for each invocation it opens Firecracker's host vsock socket, issues the `CONNECT <port>` handshake, optionally sends a payload, and drains the response, which is how a snapshot-restored function server is triggered. It reports the invocation count, errors, and a latency summary. Because the firecracker adapter runs each restore in a `{api_sock}.d` scratch cwd and the guest's uds is relative (`fn.vsock`), set a fixed `api_sock` and point the workload's `uds` at `{that}.d/fn.vsock`:
+
+```yaml
+target:
+  adapter: firecracker
+  config:
+    api_sock: /tmp/assayist-fc.sock
+    from_snapshot: "{def_dir}/../run/fn/snapshot"
+    mem_file: "{def_dir}/../run/fn/mem"
+workload:
+  driver: vsock
+  config: { uds: /tmp/assayist-fc.sock.d/fn.vsock, port: 5000, invocations: 50 }
+```
+
+Numbers a workload reports (the `vsock` latency summary, fio's iops, or an external tool's numbers surfaced through the report) are reduced to gradeable `workload:<field>` metrics, so they are compared by the gate rather than left as inert provenance. Polarity follows the field name and unit: a `*_ns` latency reads lower-better, an `iops`/`bytes` field higher-better.
 
 ## The contract is the load-bearing piece
 

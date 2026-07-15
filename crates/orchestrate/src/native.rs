@@ -23,7 +23,9 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
@@ -539,6 +541,151 @@ fn wrk_summary(text: &str) -> Value {
     })
 }
 
+// --- vsock workload ---------------------------------------------------------
+
+/// Drives an agentless guest over Firecracker's host-side vsock socket. For each
+/// invocation it opens the uds, issues the Firecracker `CONNECT <port>`
+/// handshake, optionally sends a payload, and drains the guest's response to EOF.
+/// The connection itself is the invocation (that is how a snapshot-restored
+/// function server is triggered), so this exercises the guest's working set
+/// inside the capture window rather than letting it sit idle. `report` gives the
+/// invocation count, error count, and a latency summary; timings are wall-clock
+/// round-trips measured host-side.
+///
+/// The uds is the firecracker adapter's per-run vsock path. Because the adapter
+/// runs each restore in a `{api_sock}.d` scratch cwd and the guest's uds is
+/// relative (`fn.vsock`), a def coordinates the two: set a fixed `api_sock` on
+/// the target and point `uds` at `{that}.d/{relative-name}`.
+pub struct VsockWorkload {
+    uds: String,
+    port: u32,
+    invocations: u32,
+    payload: Vec<u8>,
+    timeout: Duration,
+    latencies_ns: RefCell<Vec<u128>>,
+    errors: RefCell<u32>,
+}
+
+pub fn vsock_workload(
+    config: &BTreeMap<String, Value>,
+    vars: &BTreeMap<String, String>,
+) -> VsockWorkload {
+    let g = |k: &str, d: &str| cfg(config, vars, k, d);
+    VsockWorkload {
+        uds: g("uds", ""),
+        port: g("port", "5252").parse().unwrap_or(5252),
+        invocations: g("invocations", "50").parse().unwrap_or(50),
+        payload: g("payload", "").into_bytes(),
+        timeout: Duration::from_millis(g("timeout_ms", "5000").parse().unwrap_or(5000)),
+        latencies_ns: RefCell::new(Vec::new()),
+        errors: RefCell::new(0),
+    }
+}
+
+impl VsockWorkload {
+    /// One invocation: connect, CONNECT handshake, optional payload, drain the
+    /// response to EOF. Returns the host-side round-trip.
+    fn invoke_once(&self) -> Result<Duration, String> {
+        let t0 = Instant::now();
+        let mut stream =
+            UnixStream::connect(&self.uds).map_err(|e| format!("connect {}: {e}", self.uds))?;
+        stream.set_read_timeout(Some(self.timeout)).map_err(|e| format!("read timeout: {e}"))?;
+        stream.set_write_timeout(Some(self.timeout)).map_err(|e| format!("write timeout: {e}"))?;
+        writeln!(stream, "CONNECT {}", self.port).map_err(|e| format!("CONNECT: {e}"))?;
+        let mut reader =
+            BufReader::new(stream.try_clone().map_err(|e| format!("clone stream: {e}"))?);
+        // Firecracker replies "OK <host_port>\n" once the guest accepts.
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|e| format!("read OK: {e}"))?;
+        if !line.starts_with("OK ") {
+            return Err(format!("vsock CONNECT {} rejected: {line:?}", self.port));
+        }
+        if !self.payload.is_empty() {
+            stream.write_all(&self.payload).map_err(|e| format!("write payload: {e}"))?;
+        }
+        // The guest treats the connection as the request, writes its response,
+        // then closes: draining to EOF makes the round-trip include the
+        // working-set touch.
+        let mut resp = Vec::new();
+        reader.read_to_end(&mut resp).map_err(|e| format!("read response: {e}"))?;
+        Ok(t0.elapsed())
+    }
+}
+
+impl Workload for VsockWorkload {
+    fn version(&self, _sh: &dyn Shell) -> String {
+        "vsock".to_string()
+    }
+
+    fn start(&self, _sh: &dyn Shell) -> Result<(), String> {
+        if self.uds.trim().is_empty() {
+            return Err("vsock workload needs a 'uds' (the firecracker host vsock socket)".into());
+        }
+        // Retry the first invocation until the guest is accepting or the timeout
+        // is up: a just-resumed guest may not have re-bound its listener yet.
+        // Once it answers, the remaining invocations run back to back.
+        let deadline = Instant::now() + self.timeout;
+        let mut last_err = String::new();
+        let first = loop {
+            match self.invoke_once() {
+                Ok(d) => break Some(d),
+                Err(e) => {
+                    last_err = e;
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        match first {
+            Some(d) => self.latencies_ns.borrow_mut().push(d.as_nanos()),
+            None => return Err(format!("vsock first invocation failed: {last_err}")),
+        }
+        for _ in 1..self.invocations {
+            match self.invoke_once() {
+                Ok(d) => self.latencies_ns.borrow_mut().push(d.as_nanos()),
+                Err(_) => *self.errors.borrow_mut() += 1,
+            }
+        }
+        Ok(())
+    }
+
+    fn stop(&self, _sh: &dyn Shell) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn report(&self, _sh: &dyn Shell) -> Result<Value, String> {
+        Ok(vsock_summary(&self.latencies_ns.borrow(), *self.errors.borrow(), self.invocations))
+    }
+}
+
+/// Summarise vsock invocation round-trips. Percentiles are nearest-rank on the
+/// sorted samples; an all-failed run reports zero invocations and the error count.
+fn vsock_summary(latencies_ns: &[u128], errors: u32, requested: u32) -> Value {
+    if latencies_ns.is_empty() {
+        return json!({"driver": "vsock", "invocations": 0, "requested": requested, "errors": errors});
+    }
+    let mut sorted = latencies_ns.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let sum: u128 = sorted.iter().sum();
+    let pct = |p: f64| -> u64 {
+        let idx = ((p * (n as f64 - 1.0)).round() as usize).min(n - 1);
+        sorted[idx] as u64
+    };
+    json!({
+        "driver": "vsock",
+        "invocations": n,
+        "requested": requested,
+        "errors": errors,
+        "latency_avg_ns": (sum / n as u128) as u64,
+        "latency_p50_ns": pct(0.50),
+        "latency_p99_ns": pct(0.99),
+        "latency_max_ns": sorted[n - 1] as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +1022,35 @@ mod tests {
         withopts.start(&sh2).unwrap();
         assert!(sh2.saw("-R2000"));
         assert!(sh2.saw("-s/s.lua"));
+    }
+
+    #[test]
+    fn vsock_summary_reports_percentiles_and_average() {
+        // 10 samples 1000..10000 ns.
+        let lat: Vec<u128> = (1..=10).map(|i| i as u128 * 1000).collect();
+        let r = vsock_summary(&lat, 2, 12);
+        assert_eq!(r["invocations"], 10);
+        assert_eq!(r["requested"], 12);
+        assert_eq!(r["errors"], 2);
+        assert_eq!(r["latency_avg_ns"], 5500);
+        assert_eq!(r["latency_max_ns"], 10000);
+        assert_eq!(r["latency_p50_ns"], 6000); // nearest-rank idx round(0.5*9)=5 -> 6000
+        assert_eq!(r["latency_p99_ns"], 10000);
+    }
+
+    #[test]
+    fn vsock_summary_with_no_samples_is_zero() {
+        let r = vsock_summary(&[], 5, 5);
+        assert_eq!(r["invocations"], 0);
+        assert_eq!(r["errors"], 5);
+        assert!(r.get("latency_avg_ns").is_none());
+    }
+
+    #[test]
+    fn vsock_start_without_uds_is_an_error() {
+        let w = vsock_workload(&config(&[("port", json!("5252"))]), &vars(&[]));
+        let sh = FakeShell::new();
+        let err = w.start(&sh).unwrap_err();
+        assert!(err.contains("uds"), "{err}");
     }
 }

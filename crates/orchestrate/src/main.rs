@@ -50,6 +50,7 @@ fn select_workload(def: &BenchmarkDef, vars: BTreeMap<String, String>) -> Box<dy
         d if d == "wrk" || d.starts_with("wrk") => {
             Box::new(native::wrk_workload(&def.workload.config, &vars))
         }
+        "vsock" => Box::new(native::vsock_workload(&def.workload.config, &vars)),
         _ => Box::new(adapter::command_workload(def, vars)),
     }
 }

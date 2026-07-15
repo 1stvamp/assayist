@@ -52,6 +52,26 @@ fn f(v: &Value, k: &str) -> Option<f64> {
     v.get(k).and_then(|x| x.as_f64())
 }
 
+/// Collect every numeric leaf of a JSON value, keyed by its dotted path. Used to
+/// turn a workload report (flat or nested, e.g. fio's read/write objects) into
+/// gradeable scalars. Non-numeric leaves (a `driver` tag, strings) are skipped.
+fn flatten_numbers(prefix: &str, v: &Value, out: &mut Vec<(String, f64)>) {
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                flatten_numbers(&key, val, out);
+            }
+        }
+        Value::Number(n) => {
+            if let Some(x) = n.as_f64() {
+                out.push((prefix.to_string(), x));
+            }
+        }
+        _ => {}
+    }
+}
+
 fn u64s(v: &Value) -> Vec<u64> {
     v.as_array()
         .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
@@ -183,6 +203,32 @@ pub fn reduce(run: &Value) -> Vec<Metric> {
         }
     }
 
+    // Workload report -> gradeable scalars. A native workload (fio, wrk, vsock)
+    // or an imported external tool reports its own numbers here; surface every
+    // numeric leaf (nested objects flatten with dotted keys) as `workload:<key>`
+    // so the gate can compare them rather than leaving them as inert provenance.
+    // Polarity comes from the key/unit like any other metric, so a latency field
+    // reads lower-better and a throughput field higher-better; a field with no
+    // known direction stays Unknown and cannot by itself fail the gate.
+    if let Some(rep) = run.get("workload_report") {
+        let mut flat = Vec::new();
+        flatten_numbers("", rep, &mut flat);
+        for (k, n) in flat {
+            let id = format!("workload:{k}");
+            let unit = if k.ends_with("_ns") {
+                "ns"
+            } else if k.ends_with("_us") {
+                "us"
+            } else if k.ends_with("_ms") {
+                "ms"
+            } else {
+                ""
+            };
+            let polarity = polarity_of(&id, unit);
+            out.push(Metric { id, value: n, contaminated: false, polarity });
+        }
+    }
+
     // Spans -> durations.
     if let Some(spans) = run.get("spans").and_then(|v| v.as_array()) {
         for sp in spans {
@@ -198,4 +244,31 @@ pub fn reduce(run: &Value) -> Vec<Metric> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workload_report_numbers_become_gradeable_metrics() {
+        let run = json!({
+            "workload_report": {
+                "driver": "vsock",
+                "invocations": 30,
+                "latency_p50_ns": 350000,
+                "read": { "iops": 12000.0 }
+            }
+        });
+        let m: std::collections::HashMap<String, Metric> =
+            reduce(&run).into_iter().map(|x| (x.id.clone(), x)).collect();
+
+        // The string driver tag is skipped; numeric leaves (incl. nested) surface.
+        assert!(!m.contains_key("workload:driver"));
+        assert_eq!(m["workload:invocations"].value, 30.0);
+        // Latency in ns reads lower-better; nested iops reads higher-better.
+        assert_eq!(m["workload:latency_p50_ns"].polarity, Polarity::LowerBetter);
+        assert_eq!(m["workload:read.iops"].polarity, Polarity::HigherBetter);
+    }
 }
