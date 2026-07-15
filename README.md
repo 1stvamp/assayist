@@ -32,14 +32,14 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `crates/contract` (typed producer-side model, grading) | built, tested |
 | `crates/gate` (permutation A/B, drift, subsystem triad) | built, tested, six scenarios verified |
 | `capture/kvm` (exit-handling latency) | built and run: captured 100k+ real exits from a Firecracker microVM |
-| `capture/block` (block-IO latency per device) | written, needs a BTF host to build/run |
+| `capture/block` (block-IO latency per device) | built and run: per-device read/write latency + byte counters over a cold snapshot restore, driven through `assayist run` alongside the kvm gadget |
 | `capture/net` (tap/virtio-net counters + size histograms) | written, needs a BTF host |
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | written, needs a BTF host |
 | OTLP export + import (`crates/otlp`) | built, tested; wired as `assayist export` / `import` |
 | `crates/orchestrate` (run defs -> host prep -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export`/`import` |
 | native adapters: `firecracker` target, `fio` + `wrk` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk |
 
-Verified by execution: the core (contract, gate, OTLP round-trip), and the whole pipeline end-to-end on a nested-KVM host. The kvm gadget captured a live Firecracker microVM's exits, the firecracker/fio/wrk adapters drove real runs, and a fully-prepped, vCPU-pinned run graded `reproducible`. The block/net/ctrlplane gadgets are written but not yet run: they each need a BTF-enabled Linux host with clang and bpftool.
+Verified by execution: the core (contract, gate, OTLP round-trip), and the whole pipeline end-to-end on a nested-KVM host. The kvm gadget captured a live Firecracker microVM's exits, the firecracker/fio/wrk adapters drove real runs, and a fully-prepped, vCPU-pinned run graded `reproducible`. The block gadget captured per-device I/O latency over a cold snapshot restore in the same run as the kvm gadget. The net/ctrlplane gadgets are written but not yet run: they each need a BTF-enabled Linux host with clang and bpftool.
 
 ## Layout
 

@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::fs;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
