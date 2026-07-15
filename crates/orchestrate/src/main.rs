@@ -441,7 +441,14 @@ fn capture_cmd(args: &[String]) -> ExitCode {
     // Real adapter/workload versions from the tools themselves (a `--version`
     // query, no provisioning), rather than the 0.0.0 placeholder.
     let shell = adapter::SystemShell;
-    let vars = adapter::vars(&params, &ca.sut_sha);
+    let mut vars = adapter::vars(&params, &ca.sut_sha);
+    if let Some(dir) = std::path::Path::new(&ca.def_path)
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+    {
+        vars.insert("def_dir".to_string(), dir.to_string_lossy().into_owned());
+    }
     let target = select_target(&def, vars.clone(), prep.pin_threads);
     let workload = select_workload(&def, vars);
     let versions = run::AdapterVersions {
@@ -586,10 +593,44 @@ fn run_cmd(args: &[String]) -> ExitCode {
     let mut a_files: Vec<PathBuf> = Vec::new();
     let mut b_files: Vec<PathBuf> = Vec::new();
 
-    for (group, sut) in [("a", &ra.a_sut), ("b", &ra.b_sut)] {
-        for (ci, cell) in cells.iter().enumerate() {
+    // Directory of the def file, exposed to config templates as `{def_dir}` so a
+    // committed def can reference assets by repo-relative path rather than a
+    // machine-specific absolute one.
+    let def_dir = std::path::Path::new(&ra.def_path)
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Groups A and B. With `compare` set, they are the two values of that
+    // parameterise dimension (validated to be exactly two), and any other
+    // dimensions form cells within each group. Without it, both groups run every
+    // cell and differ only by SUT sha (the legacy build-vs-build A/B).
+    let groups: Vec<(&str, &str, Vec<&def::Cell>)> = match &def.compare {
+        Some(dim) => {
+            let values = &def.parameterise[dim];
+            [("a", ra.a_sut.as_str(), &values[0]), ("b", ra.b_sut.as_str(), &values[1])]
+                .into_iter()
+                .map(|(label, sut, v)| {
+                    let sel = cells.iter().filter(|c| c.params.get(dim) == Some(v)).collect();
+                    (label, sut, sel)
+                })
+                .collect()
+        }
+        None => vec![
+            ("a", ra.a_sut.as_str(), cells.iter().collect()),
+            ("b", ra.b_sut.as_str(), cells.iter().collect()),
+        ],
+    };
+
+    for &(group, sut, ref group_cells) in &groups {
+        for (ci, cell) in group_cells.iter().enumerate() {
             for i in 0..ra.repeat {
-                let vars = adapter::vars(&cell.params, sut);
+                let mut vars = adapter::vars(&cell.params, sut);
+                if !def_dir.is_empty() {
+                    vars.insert("def_dir".to_string(), def_dir.clone());
+                }
                 let target = select_target(&def, vars.clone(), prep.pin_threads);
                 let workload = select_workload(&def, vars);
 
