@@ -5,14 +5,15 @@ out as they land. Durable design lives in `docs/`, session pickup in `HANDOFF.md
 
 ## Deferred scope (orchestrator stages 4-5)
 
-- [x] **`wrk` HTTP workload added.** `workload.driver: wrk` (or `wrk*`) selects a
-  native adapter that runs wrk to completion in the capture window and parses its
-  text summary into requests/sec, transfer/sec, avg/max latency, and total
-  requests. Config: `url`, `threads`, `connections`, `duration`, optional `rate`
-  (wrk2) and `script`. Unit-tested via the shell seam; NOT yet run against real
-  wrk (needs a target HTTP server, e.g. a guest workload; validate alongside the
-  next KVM-host run). wrk has no native JSON output, so the parse is text-based
-  and could drift with wrk versions.
+- [x] **`wrk` HTTP workload added and validated on real wrk.** `workload.driver:
+  wrk` (or `wrk*`) selects a native adapter that runs wrk to completion in the
+  capture window and parses its text summary into requests/sec, transfer/sec,
+  avg/max latency, and total requests. Config: `url`, `threads`, `connections`,
+  `duration`, optional `rate` (wrk2) and `script`. Validated end-to-end against
+  real wrk 4.1.0 in an Incus container (wrk driving a local HTTP server through
+  `assayist run`): the report parsed correctly and the pipeline graded + gated
+  clean, no code changes needed. wrk has no native JSON output, so the parse is
+  text-based and could still drift with future wrk versions.
 - [x] **`pinning_layout` is recorded when `pin_threads` is set (validated on real
   firecracker).** The firecracker target pins each vCPU thread to a matching
   logical CPU (`fc_vcpu <n>` -> CPU `n`, via `taskset`) in `reach_steady` and
