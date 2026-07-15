@@ -32,6 +32,14 @@ pub struct BenchmarkDef {
     pub gate: GateSpec,
     #[serde(default)]
     pub parameterise: BTreeMap<String, Vec<Value>>,
+    /// Names a `parameterise` dimension to use as the A/B axis: its two values
+    /// become groups A and B, and `assayist run` gates one against the other in a
+    /// single invocation. The dimension is still substituted into config
+    /// templates as `{name}` and recorded in each run's `params`. Other
+    /// `parameterise` dimensions form cells within each group. Absent = the
+    /// legacy A/B-by-SUT behaviour (same config, two builds).
+    #[serde(default)]
+    pub compare: Option<String>,
     #[serde(default)]
     pub capture: Vec<CaptureEntry>,
     #[serde(default)]
@@ -168,6 +176,19 @@ pub fn validate(def: &BenchmarkDef) -> Result<(), Vec<String>> {
             def.tenancy,
             TENANCIES.join(", ")
         ));
+    }
+
+    if let Some(dim) = &def.compare {
+        match def.parameterise.get(dim) {
+            None => errs.push(format!(
+                "compare '{dim}' names no parameterise dimension (declare it under parameterise with two values)"
+            )),
+            Some(values) if values.len() != 2 => errs.push(format!(
+                "compare '{dim}' needs exactly two values for an A/B comparison, found {}",
+                values.len()
+            )),
+            Some(_) => {}
+        }
     }
 
     for c in &def.capture {
@@ -348,6 +369,7 @@ mod tests {
                 ignore: vec![],
             },
             parameterise: BTreeMap::new(),
+            compare: None,
             capture: vec![],
             host_prep: Value::Null,
             tenancy: "single_tenant".into(),
@@ -387,6 +409,63 @@ tenancy: single_tenant
         // cardinality is a required field, so the def fails to parse: the
         // load-time rejection of a missing cardinality decl.
         assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn compare_naming_unknown_dimension_is_rejected() {
+        let yaml = r#"
+apiVersion: assayist/v0
+name: bad
+target: { adapter: x }
+workload: { driver: y }
+gate: { mode: ab_permutation }
+compare: variant
+parameterise:
+  vcpu: [1, 2]
+tenancy: single_tenant
+"#;
+        let (def, _) = parse(yaml).unwrap();
+        let errs = validate(&def).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("compare 'variant'")));
+    }
+
+    #[test]
+    fn compare_dimension_needs_exactly_two_values() {
+        let yaml = r#"
+apiVersion: assayist/v0
+name: bad
+target: { adapter: x }
+workload: { driver: y }
+gate: { mode: ab_permutation }
+compare: variant
+parameterise:
+  variant: [a, b, c]
+tenancy: single_tenant
+"#;
+        let (def, _) = parse(yaml).unwrap();
+        let errs = validate(&def).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("exactly two values")));
+    }
+
+    #[test]
+    fn compare_over_a_two_value_dimension_validates() {
+        let yaml = r#"
+apiVersion: assayist/v0
+name: ok
+target: { adapter: x }
+workload: { driver: y }
+gate: { mode: ab_permutation }
+compare: variant
+parameterise:
+  variant: [stock, prefetch]
+tenancy: single_tenant
+"#;
+        let (def, _) = parse(yaml).unwrap();
+        validate(&def).expect("two-value compare is valid");
+        // The compare dimension is a normal parameterise axis: it expands to two
+        // cells whose params carry the variant, which run_cmd splits into A/B.
+        let cells = expand_cells(&def);
+        assert_eq!(cells.len(), 2);
     }
 
     #[test]

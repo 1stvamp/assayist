@@ -149,6 +149,23 @@ For each parameterisation cell it applies host prep (governor/SMT/THP, verified 
 
 `assayist capture` fires the gadgets once; `assayist inspect` is the read-only parse/validate/observe.
 
+### Comparing two configs
+
+By default A and B are two builds of the same config (`--a-sut`/`--b-sut`). To compare two *configurations* of one build instead (a stock restore vs a prefetched one, two snapshot-prep modes, a flag on vs off), name a `parameterise` dimension as the A/B axis with `compare`. Its two values become groups A and B, so a single `assayist run` gates one against the other:
+
+```yaml
+compare: variant
+parameterise:
+  variant: [eph-default, eph-init-on-free]
+target:
+  adapter: firecracker
+  config:
+    from_snapshot: "{def_dir}/../run/syn-alloc-heavy/{variant}/snapshot"
+    mem_file: "{def_dir}/../run/syn-alloc-heavy/{variant}/mem"
+```
+
+The variant is substituted into config templates as `{variant}` and recorded in each run's `params`. Any other `parameterise` dimensions form cells within each group. Config templates also expand `{def_dir}` (the directory of the def file), so a committed def references its assets by repo-relative path rather than a machine-specific absolute one. The `pre_restore` config key runs a shell command before the timed `snapshot/load` (outside the span), which is how a def sets the page-cache state a restore starts from: drop caches for a cold baseline, or warm a working set so resume faults hit cache.
+
 ## The contract is the load-bearing piece
 
 Everything agrees on one record shape, so it is the thing designed most carefully and the most expensive to change once published. It is drawn OTLP-shaped where concepts overlap (a 128-bit `run_id` becomes an OTLP `trace_id`; log2 histograms map to OTel exponential histograms at scale 0), so an OTLP import/export plugin is a rote transform rather than a rewrite. Three concepts have no OTLP equivalent and stay native because they enforce the guarantees: the host fingerprint (reproducibility), the cardinality budget (density-safety), and the observer-effect self-metrics (the low-overhead claim, carried by the ProbeCost numbers that back it up). The self-metrics are gated: a probe that runs over its budget marks the run contaminated, so the overhead claim is checked at grade time rather than taken on faith. Read [`docs/contract-v0.md`](docs/contract-v0.md) before changing the schema.
