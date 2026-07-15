@@ -89,7 +89,7 @@ pub fn new_run_id() -> String {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let ms = (now.as_millis() as u128) & ((1u128 << 48) - 1);
+    let ms = now.as_millis() & ((1u128 << 48) - 1);
 
     let mut h = Sha256::new();
     h.update(now.as_nanos().to_le_bytes());
