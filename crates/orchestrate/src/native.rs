@@ -99,6 +99,11 @@ pub struct FirecrackerTarget {
     /// (snapshot_path, mem_file): snapshot the running VM at steady state.
     snapshot_out: Option<(String, String)>,
     readiness: Option<String>,
+    /// Shell command run in restore mode after the API server is up but before
+    /// `snapshot/load`, outside the measured span. Lets a def set the page-cache
+    /// state the restore starts from: drop caches for a cold baseline, or warm a
+    /// captured working set (e.g. `bpfoliod prefetch`) so resume faults hit cache.
+    pre_restore: Option<String>,
     /// Pin each vCPU thread to a dedicated logical CPU and record the layout.
     pin_threads: bool,
     spans: RefCell<Vec<Value>>,
@@ -126,6 +131,7 @@ pub fn firecracker_target(
         .get("snapshot_out")
         .map(|_| (g("snapshot_out", ""), g("snapshot_mem", "")));
     let readiness = config.get("readiness").map(|_| g("readiness", ""));
+    let pre_restore = config.get("pre_restore").map(|_| g("pre_restore", ""));
 
     FirecrackerTarget {
         bin: g("bin", "firecracker"),
@@ -139,6 +145,7 @@ pub fn firecracker_target(
         from_snapshot,
         snapshot_out,
         readiness,
+        pre_restore,
         pin_threads,
         spans: RefCell::new(Vec::new()),
         pinning: RefCell::new(None),
@@ -204,8 +211,15 @@ impl Target for FirecrackerTarget {
         // appear. The pid goes to a file so teardown can kill by pid rather than
         // matching the command line: a `pkill -f -- "--api-sock <sock>"` also
         // matches the very shell running it and SIGTERMs itself.
+        // Run firecracker in a fresh scratch cwd, recreated each launch. A
+        // restored snapshot can carry a vsock device whose host-side uds is a
+        // *relative* path (Firecracker resolves it against cwd); without an
+        // isolated, wiped cwd a leftover socket from the previous repeat makes
+        // the next `snapshot/load` fail with EADDRINUSE. Def paths are absolute,
+        // so cd does not affect kernel/rootfs/snapshot resolution.
         let launch = format!(
-            "rm -f '{sock}' '{sock}.pid'; '{bin}' --api-sock '{sock}' >'{sock}.log' 2>&1 & \
+            "rm -f '{sock}' '{sock}.pid'; wd='{sock}.d'; rm -rf \"$wd\"; mkdir -p \"$wd\"; \
+             ( cd \"$wd\" && exec '{bin}' --api-sock '{sock}' ) >'{sock}.log' 2>&1 & \
              echo $! > '{sock}.pid'; \
              for _ in $(seq 1 100); do [ -S '{sock}' ] && exit 0; sleep 0.05; done; \
              echo 'firecracker api socket did not appear' >&2; exit 1",
@@ -215,6 +229,14 @@ impl Target for FirecrackerTarget {
         sh.run(&launch)?;
 
         if let Some((snap, mem)) = &self.from_snapshot {
+            // Set the page-cache state the restore starts from (drop caches for a
+            // cold baseline, or warm a captured working set). Run before the
+            // timed load so the prewarm cost is not charged to restore latency.
+            if let Some(cmd) = &self.pre_restore {
+                if !cmd.trim().is_empty() {
+                    sh.run(cmd)?;
+                }
+            }
             // Restore mode: load resumes the VM; that is the measured span.
             let body = json!({
                 "snapshot_path": snap,
@@ -304,7 +326,7 @@ impl Target for FirecrackerTarget {
         // match) avoids SIGTERMing the shell that runs this very command.
         let cmd = format!(
             "[ -f '{sock}.pid' ] && kill \"$(cat '{sock}.pid')\" 2>/dev/null; \
-             rm -f '{sock}' '{sock}.log' '{sock}.pid'",
+             rm -rf '{sock}' '{sock}.log' '{sock}.pid' '{sock}.d'",
             sock = self.sock
         );
         sh.run(&cmd).map(|_| ())
@@ -538,6 +560,9 @@ mod tests {
         fn saw(&self, needle: &str) -> bool {
             self.seen.borrow().iter().any(|c| c.contains(needle))
         }
+        fn first_containing(&self, needle: &str) -> Option<String> {
+            self.seen.borrow().iter().find(|c| c.contains(needle)).cloned()
+        }
     }
     impl Shell for FakeShell {
         fn run(&self, cmd: &str) -> Result<String, String> {
@@ -614,6 +639,44 @@ mod tests {
         let spans = t.spans(&sh).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0]["name"], "restore.resume_to_steady");
+    }
+
+    #[test]
+    fn firecracker_pre_restore_runs_before_load_not_in_span() {
+        let cfg = config(&[
+            ("from_snapshot", json!("/s/snap")),
+            ("mem_file", json!("/s/mem")),
+            ("pre_restore", json!("warm-the-working-set")),
+        ]);
+        let t = firecracker_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+
+        let seen = sh.seen.borrow();
+        let warm = seen.iter().position(|c| c.contains("warm-the-working-set"));
+        let load = seen.iter().position(|c| c.contains("/snapshot/load"));
+        assert!(warm.is_some() && load.is_some(), "both ran");
+        assert!(warm < load, "prewarm runs before the load");
+        // The prewarm is outside the timed span: only the load is a span.
+        let spans = t.spans(&sh).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "restore.resume_to_steady");
+    }
+
+    #[test]
+    fn firecracker_launches_in_a_wiped_scratch_cwd() {
+        // A vsock-bearing snapshot binds a relative host uds; each restore must
+        // run in a fresh, wiped cwd so a leftover socket cannot collide.
+        let cfg = config(&[("kernel", json!("/k/vmlinux")), ("rootfs", json!("/r/rootfs"))]);
+        let t = firecracker_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        let launch = sh.first_containing("--api-sock").expect("launch ran");
+        assert!(launch.contains("rm -rf \"$wd\""), "scratch cwd is wiped: {launch}");
+        assert!(launch.contains("cd \"$wd\""), "fc runs in scratch cwd: {launch}");
+
+        t.teardown(&sh).unwrap();
+        assert!(sh.saw(".sock.d"), "teardown removes the scratch dir");
     }
 
     #[test]
@@ -695,7 +758,7 @@ mod tests {
         // command line (that would SIGTERM the shell running the command).
         assert!(sh.saw("/tmp/x.sock.pid"));
         assert!(sh.saw("kill"));
-        assert!(sh.saw("rm -f '/tmp/x.sock'"));
+        assert!(sh.saw("rm -rf '/tmp/x.sock'"));
         assert!(!sh.saw("pkill"));
     }
 
