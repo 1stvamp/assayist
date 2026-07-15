@@ -7,3 +7,51 @@
 # the minimal profile, which omits them).
 rust = { version = "1.97.0", profile = "default" }
 python = "3.12"
+
+# Dev tasks: `mise tasks` to list, `mise run <name>` to run.
+
+[tasks.build]
+description = "Build the workspace core (release)"
+alias = "b"
+run = "cargo build --release"
+
+[tasks.test]
+description = "Run all workspace tests (unit + integration)"
+alias = "t"
+run = "cargo test --workspace"
+
+[tasks.test-pipeline]
+description = "Run the orchestrator end-to-end pipeline test"
+run = "cargo test -p assayist-orchestrate --test pipeline"
+
+[tasks.test-gate]
+description = "Run the gate scenario suite: six verdicts and exit codes"
+run = "bash scripts/verify-gate.sh"
+
+[tasks.lint]
+description = "Clippy with warnings denied (matches CI)"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.fmt]
+description = "Format the workspace with rustfmt"
+run = "cargo fmt --all"
+
+[tasks.ci]
+description = "Everything CI runs: lint, tests, gate suite"
+depends = ["lint", "test", "test-gate"]
+
+[tasks.testdata]
+description = "Generate synthetic gate runs into a dir (default /tmp/runs)"
+usage = 'arg "[dir]" help="output directory" default="/tmp/runs"'
+run = "python3 scripts/gen_testdata.py ${usage_dir}"
+
+[tasks.demo]
+description = "Generate runs and judge B vs A with the gate (runs anywhere)"
+run = [
+  "python3 scripts/gen_testdata.py /tmp/runs",
+  "cargo run --release -p assayist-gate -- --mode ab_permutation --a /tmp/runs/a*.json --b /tmp/runs/bsame*.json",
+]
+
+[tasks.inspect]
+description = "Parse, validate and observe the example def (read-only)"
+run = "cargo run --release -p assayist-orchestrate -- inspect examples/firecracker-boot-snapshot.assay.yaml"

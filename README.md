@@ -85,11 +85,23 @@ Producer strict, consumer liberal: the orchestrator builds runs with the typed `
 
 ## Build
 
-The core is a normal Rust workspace:
+`mise install` sets up the pinned toolchain (rust + python from `mise.toml`), the same versions CI uses. Without mise, rustup reads `rust-toolchain.toml` and installs the same rust; you supply python yourself for the gate scripts.
+
+Common tasks are defined in mise (`mise tasks` lists them):
 
 ```
-cargo build --release      # contract, gate, orchestrate
-cargo test                 # unit tests across the core
+mise run build       # cargo build --release
+mise run test        # workspace tests
+mise run test-gate   # the gate scenario suite (six verdicts)
+mise run lint        # clippy, warnings denied (matches CI)
+mise run demo        # generate runs and judge B vs A with the gate
+```
+
+Or drive cargo directly, it is a normal Rust workspace:
+
+```
+cargo build --release      # contract, gate, orchestrate, otlp
+cargo test                 # tests across the core
 ```
 
 The gadgets are excluded from the workspace and built per host, because they need BTF, clang, and bpftool. Which kernel fields and tracepoints each gadget depends on is in [`docs/compatibility-matrix.md`](docs/compatibility-matrix.md).
