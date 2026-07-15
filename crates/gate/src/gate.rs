@@ -207,6 +207,19 @@ pub fn ab(a: &[Value], b: &[Value], cfg: &Config) -> Result<Value, String> {
         }));
     }
 
+    // A comparison that tested nothing must not read as a pass. This happens
+    // when no series is present in both groups with at least two samples per
+    // group (e.g. a 1-vs-1 A/B): there is nothing to permute, so `per_metric`
+    // is empty. Refuse it as a gate error rather than returning a hollow pass.
+    if per_metric.is_empty() {
+        return Err(format!(
+            "no metric was comparable: no series appears in both groups with at least two samples per group \
+             (A has {} series, B has {}). A comparison this small cannot be gated; add more repeats per group.",
+            ga.samples.len(),
+            gb.samples.len()
+        ));
+    }
+
     let verdict = if any_contaminated {
         "contaminated"
     } else if any_regressed {
@@ -284,6 +297,15 @@ pub fn drift(baseline: &[Value], candidate: &[Value], cfg: &Config) -> Result<Va
         }));
     }
 
+    if per_metric.is_empty() {
+        return Err(format!(
+            "no metric was comparable: no series appears in both baseline and candidate with at least two samples each \
+             (baseline has {} series, candidate has {}). Add more samples per side.",
+            gb.samples.len(),
+            gc.samples.len()
+        ));
+    }
+
     let verdict = if any_drift { "fail" } else { "pass" };
     if verdict == "pass" {
         notes.push("no bad-direction drift beyond band".to_string());
@@ -337,4 +359,51 @@ pub fn triad(a: &[Value], b: &[Value], cfg: &Config) -> Result<Value, String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        Config { allow_ungraded: true, ..Default::default() }
+    }
+
+    fn counter_run(name: &str, val: f64) -> Value {
+        json!({"series": [{"name": name, "kind": "counter", "unit": "", "source": "s", "data": {"value": val}}]})
+    }
+
+    #[test]
+    fn ab_with_one_sample_per_group_errors_rather_than_hollow_pass() {
+        // 1-vs-1: no series has >= 2 samples per group, so nothing is comparable.
+        // This must be a gate error (exit 1), not a silent `pass` (exit 0).
+        let a = vec![counter_run("m", 100.0)];
+        let b = vec![counter_run("m", 110.0)];
+        let err = ab(&a, &b, &cfg()).unwrap_err();
+        assert!(err.contains("no metric was comparable"), "got: {err}");
+    }
+
+    #[test]
+    fn ab_with_disjoint_metrics_errors() {
+        // Enough samples, but no shared series -> nothing to compare.
+        let a: Vec<Value> = (0..3).map(|_| counter_run("only_a", 1.0)).collect();
+        let b: Vec<Value> = (0..3).map(|_| counter_run("only_b", 1.0)).collect();
+        assert!(ab(&a, &b, &cfg()).is_err());
+    }
+
+    #[test]
+    fn ab_with_enough_samples_grades_normally() {
+        let a: Vec<Value> = (0..3).map(|i| counter_run("m", 100.0 + i as f64)).collect();
+        let b: Vec<Value> = (0..3).map(|i| counter_run("m", 100.0 + i as f64)).collect();
+        let out = ab(&a, &b, &cfg()).unwrap();
+        assert!(!out["outcome"]["per_metric"].as_object().unwrap().is_empty());
+        assert_eq!(out["outcome"]["verdict"], "pass");
+    }
+
+    #[test]
+    fn drift_with_one_sample_each_errors() {
+        let base = vec![counter_run("m", 100.0)];
+        let cand = vec![counter_run("m", 100.0)];
+        assert!(drift(&base, &cand, &cfg()).is_err());
+    }
 }
