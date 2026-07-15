@@ -21,6 +21,12 @@ jobs:
       - name: Install toolchain (rust + python from mise.toml)
         uses: jdx/mise-action@v4
 
+      - name: Ensure clippy and rustfmt
+        # mise installs rust via rustup; add the components explicitly rather
+        # than relying on the toolchain profile, which mise-action has dropped
+        # on install before. Idempotent if they are already present.
+        run: rustup component add clippy rustfmt
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
