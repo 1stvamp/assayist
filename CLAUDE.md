@@ -26,9 +26,15 @@ Project instructions for an agent working in this repo. Complements the global `
 - Producer strict, consumer liberal: the orchestrator and `contract` crate build runs strictly (missing core fingerprint field = error). The gate reads runs liberally (tolerant JSON) so it can grade a slightly-off record rather than refuse it. Keep this split.
 - Every `MetricSeries` must declare a cardinality class; there is no `unbounded`. Reject unbounded at load, not at write.
 
+## Work tracking
+
+- Track all outstanding work, bugs, and deferred scope as GitHub issues on this repo (`gh issue create` / `gh issue list`), not in a checked-in file. There is no `TODO.md` and no `HANDOFF.md`; do not recreate them.
+- When you flag a bug or defer scope, open an issue: a clear title, and a body that states the problem, where it lives (file/path), and any workaround already in place. Reference or close the issue from the commit or PR that resolves it.
+- Session pickup / handoff notes are ephemeral: keep them in the conversation, do not commit them to the repo.
+
 ## Build model
 
-- Workspace core (`crates/contract`, `crates/gate`, `crates/orchestrate`) builds anywhere: `cargo build`, `cargo test`. Keep tests green.
+- Workspace core (`crates/contract`, `crates/gate`, `crates/orchestrate`, `crates/otlp`) builds anywhere: `cargo build`, `cargo test`. Keep tests green.
 - eBPF gadgets (`capture/*`) are excluded from the workspace. They need a BTF-enabled Linux host with clang + bpftool. Generate `vmlinux.h` once per host (see each gadget README). The orchestrator invokes them as subprocess binaries emitting JSON fragments, not as linked crates.
 - Gadget userspace targets libbpf-rs 0.24; the prog-info call goes through libbpf-sys directly because the safe wrapper shape varies by version. Expect minor API drift on other point releases.
 

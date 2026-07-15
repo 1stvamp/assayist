@@ -10,7 +10,7 @@
 //! property): missing cardinality decl (a required field, so parse fails),
 //! unbounded cardinality, a bounded series without a key source or ceiling,
 //! an unknown gate mode, an unknown tenancy class, and a uprobe declared on a
-//! hot path (only when the entry declares its attach kind, see TODO.md).
+//! hot path (checked when the entry declares its attach kind).
 
 use std::collections::BTreeMap;
 
@@ -97,8 +97,9 @@ pub struct CaptureEntry {
     /// contract's "rejected by default" behaviour.
     pub cardinality: Cardinality,
     /// Optional attach kind, so the uprobe-on-hot-path check can fire when the
-    /// def author declares it. See TODO.md for the open decision on whether this
-    /// belongs in the def or is discovered from the gadget.
+    /// def author declares it. Attach kind is author-declared, not discovered
+    /// from the gadget; a declared value is validated against the contract's
+    /// `attach_kind` vocabulary.
     #[serde(default)]
     pub attach: Option<String>,
     #[serde(default)]
@@ -235,7 +236,7 @@ pub fn expand_cells(def: &BenchmarkDef) -> Vec<Cell> {
         .into_iter()
         .map(|combo| {
             let mut map = serde_json::Map::new();
-            for ((name, _), v) in axes.iter().zip(combo.into_iter()) {
+            for ((name, _), v) in axes.iter().zip(combo) {
                 map.insert((*name).clone(), v);
             }
             let params = Value::Object(map);

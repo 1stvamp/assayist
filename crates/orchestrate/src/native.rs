@@ -14,8 +14,7 @@
 //! curl calls are the same requests a socket client would send, and every other
 //! adapter in the crate already goes through `Shell`.
 //!
-//! Limits: neither has been exercised against a real firecracker/fio yet (needs
-//! a KVM host; see HANDOFF.md). The `boot.api_to_init` span measures the
+//! Limits: the `boot.api_to_init` span measures the
 //! InstanceStart API round-trip, not the guest reaching userspace init: without
 //! an in-guest agent the host cannot observe guest-init, and adding one would
 //! break the agentless vantage. `reach_steady` runs an optional author-supplied

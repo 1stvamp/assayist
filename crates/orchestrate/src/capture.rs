@@ -30,7 +30,8 @@ pub struct GadgetInvocation {
 
 /// Turn the def's capture entries into concrete launches. For v0 every gadget
 /// gets `--duration` and `--out`; per-gadget cardinality flags (e.g. the kvm
-/// gadget's `--per-guest`/`--max-keys`) are not mapped yet (see TODO.md).
+/// gadget's `--per-guest`/`--max-keys`) come from each entry's `args`, appended
+/// verbatim.
 pub fn plan_gadgets(
     entries: &[CaptureEntry],
     duration_secs: u64,
