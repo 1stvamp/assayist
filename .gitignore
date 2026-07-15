@@ -10,3 +10,5 @@ capture/*/src/bpf/vmlinux.h
 # local agent scratch (do not commit)
 /.claude/settings.local.json
 /.remember/
+# project agent instructions, kept local
+/CLAUDE.local.md
