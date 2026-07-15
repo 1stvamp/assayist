@@ -2,7 +2,9 @@
 
 One benchmarking system for VMs, microVMs, unikernels, hypervisors, and eBPF-as-subsystem experiments. Low observer effect, high information, standardised, and honest about what it cannot see.
 
-Assayist does not try to standardise the thing under test. It standardises three things around it: a metric contract, a host/KVM-side eBPF capture plane, and a decision gate. Targets and workloads are pluggable adapters. A fixed spine, two pluggable edges.
+Reach for it when you want CI-gradeable A/B benchmarks of a guest workload (a full VM, a Firecracker microVM, a unikernel) without putting an agent inside the guest, and a verdict you can trust because the run records how it was measured.
+
+Assayist does not try to standardise the thing under test. It standardises three things around it: a metric contract, a host/KVM-side eBPF capture plane, and a decision gate. Targets and workloads are pluggable adapters that plug into that fixed spine.
 
 ```
       target adapter                         workload driver
@@ -18,7 +20,7 @@ Assayist does not try to standardise the thing under test. It standardises three
    +-------------------------------------------------------+
 ```
 
-The capture plane is universal because it sits host-side on KVM tracepoints and the virtio/tap path, so it observes a full VM, a Firecracker microVM, or a unikernel guest the same way, with no in-guest agent. That is what lets one system span every problem space.
+The capture plane is universal because it sits host-side on KVM tracepoints and the virtio/tap path, so it observes a full VM, a Firecracker microVM, or a unikernel guest the same way, with no in-guest agent. So one system covers all of those guest types instead of a separate tool per space. [`docs/architecture.md`](docs/architecture.md) is the fuller design brief with the coverage matrix; [`docs/research-survey.md`](docs/research-survey.md) has the evidence behind the low-overhead numbers.
 
 Why "assay": a benchmark run is an assay, a controlled measurement of one preparation against another under stated conditions. The record it produces is an `AssayRun`.
 
@@ -26,18 +28,18 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 
 | Component | State |
 |---|---|
-| Metric contract (`docs/contract-v0.md`, `contract/assay-run.schema.json`) | drafted, v0 |
+| Metric contract (`docs/contract-v0.md`, `contract/assay-run.schema.json`) | v0 |
 | `crates/contract` (typed producer-side model, grading) | built, tested |
-| `crates/gate` (permutation A/B, drift, subsystem triad) | built, tested, verified against synthetic data |
-| `capture/kvm` (exit-handling latency) | written, needs a BTF+KVM host to build/run |
-| `capture/block` (block-IO latency per device) | written, needs a BTF host |
+| `crates/gate` (permutation A/B, drift, subsystem triad) | built, tested, six scenarios verified |
+| `capture/kvm` (exit-handling latency) | built and run: captured 100k+ real exits from a Firecracker microVM |
+| `capture/block` (block-IO latency per device) | written, needs a BTF host to build/run |
 | `capture/net` (tap/virtio-net counters + size histograms) | written, needs a BTF host |
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | written, needs a BTF host |
 | OTLP export + import (`crates/otlp`) | built, tested; wired as `assayist export` / `import` |
-| `crates/orchestrate` (run defs -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export` |
-| reference adapters: `firecracker` target + `fio` workload (`crates/orchestrate/src/native.rs`) | built, unit-tested; unexercised on a real KVM host |
+| `crates/orchestrate` (run defs -> host prep -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export`/`import` |
+| native adapters: `firecracker` target, `fio` + `wrk` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk |
 
-The gate is the only piece verified by execution here; the gadgets are written to be correct but need a BTF-enabled Linux host with clang and bpftool to build and run.
+Verified by execution: the core (contract, gate, OTLP round-trip), and the whole pipeline end-to-end on a nested-KVM host. The kvm gadget captured a live Firecracker microVM's exits, the firecracker/fio/wrk adapters drove real runs, and a fully-prepped, vCPU-pinned run graded `reproducible`. The block/net/ctrlplane gadgets are written but not yet run: they each need a BTF-enabled Linux host with clang and bpftool.
 
 ## Layout
 
@@ -54,12 +56,10 @@ assayist/
   crates/                  host-agnostic core (workspace members)
     contract/              typed AssayRun, grading, fragment merge
     gate/                  the decision engine
-    orchestrate/           the orchestrator (stub)
+    orchestrate/           the orchestrator; native.rs holds the firecracker/fio/wrk adapters
+    otlp/                  OTLP export/import
   capture/                 eBPF gadgets (standalone, build per BTF host)
     kvm/  block/  net/  ctrlplane/
-  adapters/
-    targets/               reference target adapters (future)
-    workloads/             reference workload drivers (future)
   examples/
     firecracker-boot-snapshot.assay.yaml
 ```
@@ -71,7 +71,7 @@ A run is assembled, then judged:
 1. The orchestrator reads a benchmark def (`examples/*.assay.yaml`), applies host prep, and reads the applied state back into a host fingerprint.
 2. It starts the target adapter and workload driver, and fires the relevant capture gadgets.
 3. Each gadget aggregates in-kernel and emits a JSON **fragment** (`series` + `self_metrics` + `capture_meta`).
-4. The orchestrator merges the fragments with identity, fingerprint, gate context, and lifecycle spans into one **AssayRun**, and computes its **grade**.
+4. The orchestrator merges the fragments with identity, fingerprint, gate context, and lifecycle spans into one **AssayRun**, and computes its **grade**: `reproducible` (host fully prepped and vCPU-pinned, probes within budget), `valid` (ran cleanly but not fully prepped), or `invalid` (the recorded tuning did not match the host, so the run is a lie).
 5. Repeated runs form A and B groups (or a baseline trajectory). The **gate** reduces each run to scalars, runs the permutation test (or drift, or triad), and returns a verdict.
 
 ```
@@ -81,7 +81,7 @@ gadget --> fragment --/                                         > gate --> verdi
                                           AssayRun (graded) --/
 ```
 
-Producer strict, consumer liberal: the orchestrator builds runs with the typed `contract` crate, so a missing core fingerprint field is a construct error. The gate reads runs liberally (tolerant JSON) so it can grade a slightly-off record rather than refuse it. That split is deliberate.
+Producer strict, consumer liberal: the orchestrator builds runs with the typed `contract` crate, so a missing core fingerprint field is a construct error. The gate reads runs liberally (tolerant JSON) so it can grade a slightly-off record rather than refuse it.
 
 ## Build
 
@@ -92,7 +92,7 @@ cargo build --release      # contract, gate, orchestrate
 cargo test                 # unit tests across the core
 ```
 
-The gadgets are excluded from the workspace and built per host, because they need BTF, clang, and bpftool:
+The gadgets are excluded from the workspace and built per host, because they need BTF, clang, and bpftool. Which kernel fields and tracepoints each gadget depends on is in [`docs/compatibility-matrix.md`](docs/compatibility-matrix.md).
 
 ```
 cd capture/kvm
@@ -104,20 +104,42 @@ cargo build --release
 
 ## Quickstart: the gate
 
-The gate works today. Judge a candidate group B against a baseline group A:
+The gate works today, on any machine (no eBPF host needed). One command builds it, generates synthetic runs, and checks all six verdicts against their expected exit codes:
+
+```
+./scripts/verify-gate.sh
+```
+
+To drive it directly, generate a set of runs and judge a candidate group B against a baseline group A:
 
 ```
 cargo build --release -p assayist-gate
+python3 scripts/gen_testdata.py /tmp/runs
 ./target/release/assayist-gate --mode ab_permutation \
-  --a runs/a0.json runs/a1.json ... \
-  --b runs/b0.json runs/b1.json ...
+  --a /tmp/runs/a{0..9}.json \
+  --b /tmp/runs/bsame{0..9}.json     # bsame -> pass, breg -> fail, bcont -> contaminated
 ```
 
-Exit codes for CI: `0` pass, `1` gate error, `2` fail, `3` contaminated. Modes: `ab_permutation`, `longitudinal_drift`, `subsystem_triad`. See `crates/gate/README.md` for the decision rules and the findings that shaped them.
+The permutation test needs at least two runs per group (a 1-vs-1 comparison has nothing to permute, and grades a hollow `pass`). Exit codes for CI: `0` pass, `1` gate error, `2` fail, `3` contaminated. Modes: `ab_permutation`, `longitudinal_drift`, `subsystem_triad`. See [`crates/gate/README.md`](crates/gate/README.md) for the decision rules and the findings that shaped them.
+
+## The full pipeline
+
+On a BTF+KVM host with the gadgets built, `assayist run` drives everything from a def:
+
+```
+./target/release/assayist run examples/firecracker-boot-snapshot.assay.yaml \
+  --repeat 4 --a-sut <shaA> --b-sut <shaB> --apply-prep
+```
+
+For each parameterisation cell it applies host prep (governor/SMT/THP, verified by read-back), pins vCPU threads if the def asks, boots the target and runs the workload across the capture window, assembles a graded `AssayRun` per repeat, then shells out to the gate and propagates its exit code.
+
+**Note**: `--apply-prep` writes sysfs and needs root. Without it the host is observed read-only, and a run whose tuning the host does not already match grades `invalid`.
+
+`assayist capture` fires the gadgets once; `assayist inspect` is the read-only parse/validate/observe.
 
 ## The contract is the load-bearing piece
 
-Everything agrees on one record shape, so it is the thing designed most carefully and the most expensive to change once published. It is drawn OTLP-shaped where concepts overlap (a 128-bit `run_id` becomes an OTLP `trace_id`; log2 histograms map to OTel exponential histograms at scale 0), so an OTLP import/export plugin is a rote transform rather than a rewrite. Three concepts have no OTLP equivalent and stay native because they enforce the guarantees: the host fingerprint (reproducibility), the cardinality budget (density-safety), and the observer-effect self-metrics (the low-overhead claim, measured not asserted). Read `docs/contract-v0.md` before changing the schema.
+Everything agrees on one record shape, so it is the thing designed most carefully and the most expensive to change once published. It is drawn OTLP-shaped where concepts overlap (a 128-bit `run_id` becomes an OTLP `trace_id`; log2 histograms map to OTel exponential histograms at scale 0), so an OTLP import/export plugin is a rote transform rather than a rewrite. Three concepts have no OTLP equivalent and stay native because they enforce the guarantees: the host fingerprint (reproducibility), the cardinality budget (density-safety), and the observer-effect self-metrics (the low-overhead claim, carried by the ProbeCost numbers that back it up). The self-metrics are gated: a probe that runs over its budget marks the run contaminated, so the overhead claim is checked at grade time rather than taken on faith. Read [`docs/contract-v0.md`](docs/contract-v0.md) before changing the schema.
 
 ## What Assayist will not do
 

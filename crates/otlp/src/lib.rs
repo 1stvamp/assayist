@@ -573,13 +573,12 @@ fn metric_to_series(m: &Value) -> Option<Value> {
         s.insert("kind".into(), json!("counter"));
         carry_source_key(dp, &mut s);
         s.insert("data".into(), json!({ "value": str_u64(dp.get("asInt")), "start_unix_nano": str_u64(dp.get("timeUnixNano")) }));
-    } else if let Some(g) = m.get("gauge") {
+    } else {
+        let g = m.get("gauge")?;
         let dp = g.get("dataPoints")?.get(0)?;
         s.insert("kind".into(), json!("gauge"));
         carry_source_key(dp, &mut s);
         s.insert("data".into(), json!({ "value": dp.get("asDouble").and_then(|v| v.as_f64()).unwrap_or(0.0), "time_unix_nano": str_u64(dp.get("timeUnixNano")) }));
-    } else {
-        return None;
     }
     Some(Value::Object(s))
 }

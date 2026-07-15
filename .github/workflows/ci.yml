@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    # Workspace core only (contract, gate, orchestrate, otlp). The eBPF gadgets
+    # under capture/ are excluded from the workspace: they need a BTF-enabled
+    # host with clang + bpftool, so they are not built here.
+    name: build / test / lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (rust + python from mise.toml)
+        uses: jdx/mise-action@v4
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Gate scenario suite
+        # Regenerates synthetic runs and checks all six verdicts and exit codes.
+        run: bash scripts/verify-gate.sh

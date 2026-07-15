@@ -1,0 +1,9 @@
+# Pins the toolchain so local dev and CI use the same versions.
+# `mise install` sets these up; CI installs them via jdx/mise-action.
+# rust is also pinned in rust-toolchain.toml (mise and rustup both read it);
+# keep the two at the same version.
+[tools]
+# profile = "default" so clippy and rustfmt are installed (mise defaults rust to
+# the minimal profile, which omits them).
+rust = { version = "1.97.0", profile = "default" }
+python = "3.12"

@@ -20,7 +20,7 @@ use serde_json::Value;
 /// when the def asked for it, and read back with the same shape, so a
 /// requested-vs-readback comparison is meaningful. `pin_threads` is not here: it
 /// is not a global sysfs value, it is a directive the target adapter carries out
-/// and records into `pinning_layout` (stage 4). See TODO.md.
+/// and records into `pinning_layout` (done by the firecracker target).
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
 pub struct TuningKnobs {
     #[serde(skip_serializing_if = "Option::is_none")]
