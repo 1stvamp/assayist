@@ -33,6 +33,7 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `crates/gate` (permutation A/B, drift, subsystem triad) | built, tested, six scenarios verified |
 | `capture/kvm` (exit-handling latency) | built and run: captured 100k+ real exits from a Firecracker microVM |
 | `capture/block` (block-IO latency per device) | built and run: per-device read/write latency + byte counters over a cold snapshot restore, driven through `assayist run` alongside the kvm gadget |
+| `capture/resident` (snapshot residency: mincore on the mem file) | built and run: pure userspace (no BTF), reports resident/total pages + fraction, driven through `assayist run` |
 | `capture/net` (tap/virtio-net counters + size histograms) | written, needs a BTF host |
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | written, needs a BTF host |
 | OTLP export + import (`crates/otlp`) | built, tested; wired as `assayist export` / `import` |
@@ -187,6 +188,20 @@ Numbers a workload reports (the `vsock` latency summary, fio's iops, or an exter
 ### Host memory
 
 `assayist run` samples `/proc/meminfo` before the target is provisioned and again after it reaches steady, and records the deltas as `hostmem.mem_consumed_kib` (how far `MemAvailable` dropped, lower better) and `hostmem.cached_delta_kib` (page-cache change, left without a graded direction). The window is the target lifecycle, not the gadget window, so it captures the memory cost of preparing and restoring the guest. This is a host, system-level measurement: it sees the machine's memory move, not per-guest attribution, so for a single file-backed restore the signal is small and noisy (pages are shared through the page cache, which is the point). It earns its keep across many concurrent sandboxes, where the aggregate is what separates a deduped restore from a per-sandbox copy.
+
+### Snapshot residency
+
+The `assayist-capture-resident` gadget mincores the snapshot's mem file at the end of the window and reports `resident.snapshot_resident_pages`, `resident.snapshot_total_pages`, and `resident.snapshot_fraction`, the ground-truth working set: how much of the snapshot actually faulted into the page cache. Where `hostmem` is the machine-level cost, this is what the snapshot itself has resident (bpfolio's `resident_fraction`). It is pure userspace (mmap + mincore, no eBPF or BTF), so it builds and runs anywhere; point it at the mem file with a `{def_dir}`-relative path (capture-entry `args` are rendered with the same vars as the target config):
+
+```yaml
+capture:
+  - probe: snapshot_resident
+    gadget: assayist-capture-resident
+    cardinality: { class: singleton }
+    args: ["--mem", "{def_dir}/../run/fn/mem"]
+```
+
+On a cold restore of a 256 MiB snapshot, this read ~5% resident, the working set the guest touched to reach steady. For a file-backed restore it is the set shared through the page cache (so concurrent instances of one snapshot count it once); a userfaultfd restore copies pages into each guest's own anonymous memory, off the file, so this measures the shared/file residency, not per-guest private memory.
 
 ### Concurrent sandboxes
 

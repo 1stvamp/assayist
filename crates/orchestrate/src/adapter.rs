@@ -503,7 +503,7 @@ mod tests {
             hot_path: false,
             args: vec![],
         }];
-        let plan = plan_gadgets(&entries, 1, Path::new("/tmp")).unwrap();
+        let plan = plan_gadgets(&entries, 1, Path::new("/tmp"), &BTreeMap::new()).unwrap();
 
         let art = execute_run(&sh, &runner, &target, &workload, &plan).unwrap();
         // The gadget fragment plus the synthesized hostmem fragment.

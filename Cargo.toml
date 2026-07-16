@@ -21,6 +21,7 @@ exclude = [
     "capture/block",
     "capture/net",
     "capture/ctrlplane",
+    "capture/resident",
 ]
 
 [profile.release]
