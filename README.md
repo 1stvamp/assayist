@@ -38,7 +38,7 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | built and run: captured run-queue latency from the sched tracepoints; flags `over_budget` when unscoped, scope with `--cgroup` |
 | OTLP export + import (`crates/otlp`) | built, tested; wired as `assayist export` / `import` |
 | `crates/orchestrate` (run defs -> host prep -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export`/`import` |
-| native adapters: `firecracker` + `qemu` + `cloud-hypervisor` targets, `fio` + `wrk` + `vsock` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk, `vsock` drove a restored microVM's function server, `qemu` and `cloud-hypervisor` cold-booted full VMs whose KVM exits the kvm gadget captured unchanged |
+| native adapters: `firecracker` + `qemu` + `cloud-hypervisor` + `unikernel` targets, `fio` + `wrk` + `vsock` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk, `vsock` drove a restored microVM's function server, `qemu` and `cloud-hypervisor` cold-booted full VMs, `unikernel` booted a Nanos guest, all with KVM exits the kvm gadget captured unchanged |
 
 Verified by execution: the core (contract, gate, OTLP round-trip), and the whole pipeline end-to-end on a nested-KVM host. The kvm gadget captured a live Firecracker microVM's exits, the firecracker/fio/wrk adapters drove real runs, and a fully-prepped, vCPU-pinned run graded `reproducible`. The block gadget captured per-device I/O latency over a cold snapshot restore in the same run as the kvm gadget. The ctrlplane gadget captured run-queue latency from the scheduler tracepoints, and the net gadget attached XDP and emitted (real packet counts need a tap/NIC). Every capture gadget has now been built and run on a BTF host; they each need clang and bpftool to build per-host.
 
@@ -272,6 +272,21 @@ target:
 ```
 
 Unlike firecracker and qemu, CH does not exit when the guest resets: it keeps rebooting the guest and holds a flock on `<api-socket>.lock`, so teardown waits for the process to die before the next run reuses the socket (else a repeat run fails with `ApiSocketInUse`). Validated: CH v53.0 booted the firecracker `vmlinux` + `.ext4` rootfs, `boot.vmm_ready` ~47ms, and the kvm gadget captured its exits (IO_INSTRUCTION, EPT_VIOLATION, HLT, MSR_WRITE, ...) unchanged, a third VMM through the same capture plane.
+
+### Unikernels
+
+`target.adapter: unikernel` boots a single self-contained unikernel image under QEMU/KVM, timing it up to a QMP socket appearing as `boot.vmm_ready`. A unikernel is the archetypal agentless guest, one address space with no userspace to log into, which is exactly the vantage assayist is built for: the kvm/net gadgets see it host-side without an in-guest agent. Two boot styles: `disk` (a raw disk image, e.g. Nanos/`ops` output; the default) and `kernel` (a multiboot/PVH image via `-kernel`, e.g. Unikraft). An optional `hostfwd` maps a host port to a guest port so a `readiness` probe can reach the guest, the only agentless way to confirm it is actually serving.
+
+```yaml
+target:
+  adapter: unikernel
+  config:
+    image: /path/to/unikernel-image      # raw disk (Nanos) by default
+    hostfwd: "tcp::18080-:8080"           # optional host->guest port forward
+    readiness: "curl -sf --max-time 1 http://127.0.0.1:18080/ >/dev/null"
+```
+
+Validated: a Nanos unikernel (a static Go HTTP server, built with `ops`) booted under qemu-kvm, `boot.vmm_ready` ~52ms, the readiness probe reached its forwarded port, and the kvm gadget captured its exits (MSR_WRITE, HLT, IO_INSTRUCTION, ...). It is far quieter than a full-VM or microVM boot (~1.5k exits vs tens of thousands), the small single-purpose guest showing through the capture. v0 is cold boot only (no snapshot/restore, no vCPU pinning).
 
 ## The contract is the load-bearing piece
 
