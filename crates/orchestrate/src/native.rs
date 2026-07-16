@@ -118,6 +118,10 @@ pub struct FirecrackerTarget {
     uffd_handler: Option<String>,
     /// Pin each vCPU thread to a dedicated logical CPU and record the layout.
     pin_threads: bool,
+    /// First logical CPU this instance's vCPUs pin to: `fc_vcpu n` -> CPU
+    /// `cpu_base + n`. The orchestrator sets a distinct base per concurrent
+    /// instance (via the `cpu_base` var) so they do not all land on CPU 0.
+    cpu_base: u32,
     spans: RefCell<Vec<Value>>,
     pinning: RefCell<Option<Value>>,
 }
@@ -170,6 +174,7 @@ pub fn firecracker_target(
         mem_backend,
         uffd_handler,
         pin_threads,
+        cpu_base: vars.get("cpu_base").and_then(|s| s.parse().ok()).unwrap_or(0),
         spans: RefCell::new(Vec::new()),
         pinning: RefCell::new(None),
     }
@@ -236,24 +241,26 @@ impl FirecrackerTarget {
         Ok(())
     }
 
-    /// Shell that pins each firecracker vCPU thread to a matching logical CPU
-    /// (`fc_vcpu <n>` -> CPU `n`) via `taskset` and prints the applied layout as
-    /// JSON on stdout. It reads the pid recorded at launch, so it must run after
-    /// the VM has started (threads exist). A vcpu whose `taskset` fails aborts
-    /// the run: a run that asked to pin and could not must not claim it did.
+    /// Shell that pins each firecracker vCPU thread to a logical CPU
+    /// (`fc_vcpu <n>` -> CPU `cpu_base + n`) via `taskset` and prints the applied
+    /// layout as JSON on stdout. It reads the pid recorded at launch, so it must
+    /// run after the VM has started (threads exist). A vcpu whose `taskset` fails
+    /// aborts the run: a run that asked to pin and could not must not claim it
+    /// did (e.g. when concurrent instances would need more CPUs than exist).
     fn pin_cmd(&self) -> String {
         format!(
-            "pid=$(cat '{sock}.pid'); layout=''; \
+            "pid=$(cat '{sock}.pid'); layout=''; base={base}; \
              for t in /proc/$pid/task/*; do \
                comm=$(cat \"$t/comm\" 2>/dev/null); \
                case \"$comm\" in \"fc_vcpu \"*) \
-                 n=${{comm#fc_vcpu }}; tid=${{t##*/}}; \
-                 taskset -pc \"$n\" \"$tid\" >/dev/null 2>&1 || {{ echo \"pin vcpu $n failed\" >&2; exit 7; }}; \
-                 layout=\"$layout,\\\"vcpu$n\\\":$n\"; \
+                 n=${{comm#fc_vcpu }}; tid=${{t##*/}}; cpu=$((base + n)); \
+                 taskset -pc \"$cpu\" \"$tid\" >/dev/null 2>&1 || {{ echo \"pin vcpu $n -> cpu $cpu failed\" >&2; exit 7; }}; \
+                 layout=\"$layout,\\\"vcpu$n\\\":$cpu\"; \
                ;; esac; \
              done; \
              printf '{{%s}}' \"${{layout#,}}\"",
             sock = self.sock,
+            base = self.cpu_base,
         )
     }
 }
@@ -1159,6 +1166,20 @@ mod tests {
         assert!(sh.saw("/tmp/p.sock.pid"));
         assert!(sh.saw("fc_vcpu"));
         assert_eq!(t.pinning_layout(), Some(json!({"vcpu0": 0, "vcpu1": 1})));
+    }
+
+    #[test]
+    fn firecracker_cpu_base_offsets_the_pinning() {
+        // A concurrent instance is given a cpu_base so its vCPUs pin above the
+        // earlier instances' CPUs instead of colliding on CPU 0.
+        let cfg = config(&[("kernel", json!("/k/v")), ("rootfs", json!("/k/r"))]);
+        let t = firecracker_target(&cfg, &vars(&[("vcpu", "2"), ("cpu_base", "4")]), true);
+        let sh = FakeShell::new().reply("taskset", r#"{"vcpu0":4,"vcpu1":5}"#);
+        t.provision(&sh).unwrap();
+        t.start(&sh).unwrap();
+        t.reach_steady(&sh).unwrap();
+        assert!(sh.saw("base=4"), "pin command carries the cpu base");
+        assert_eq!(t.pinning_layout(), Some(json!({"vcpu0": 4, "vcpu1": 5})));
     }
 
     #[test]
