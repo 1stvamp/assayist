@@ -542,6 +542,146 @@ impl Target for QemuTarget {
     }
 }
 
+/// A Cloud Hypervisor full-VM target (cold boot). Like the QEMU adapter it
+/// launches the VMM with a control socket and times the VM up to that socket
+/// appearing (`boot.vmm_ready`). Cloud Hypervisor boots the guest immediately
+/// when the VM config is passed on the command line, and the `--api-socket`
+/// opens the same moment, so the marker is the VMM initialising and handing off
+/// to the guest, not guest userspace init (the agentless vantage cannot see
+/// that; an optional `readiness` command bridges to a guest-ready signal). It
+/// direct-boots an uncompressed `vmlinux`, the same kernel image the firecracker
+/// adapter uses, so a firecracker-vs-CH compare shares kernel and rootfs.
+/// Concurrency, host-memory, and residency capture all ride the generic paths.
+///
+/// v0 is cold boot only: CH snapshot/restore and vCPU pinning are not wired yet.
+pub struct CloudHypervisorTarget {
+    bin: String,
+    sock: String,
+    vcpu: String,
+    mem_mib: String,
+    kernel: String,
+    rootfs: String,
+    cmdline: String,
+    extra: String,
+    readiness: Option<String>,
+    pin_threads: bool,
+    spans: RefCell<Vec<Value>>,
+}
+
+pub fn ch_target(
+    config: &BTreeMap<String, Value>,
+    vars: &BTreeMap<String, String>,
+    pin_threads: bool,
+) -> CloudHypervisorTarget {
+    let g = |k: &str, d: &str| cfg(config, vars, k, d);
+    let vcpu = vars.get("vcpu").cloned().unwrap_or_else(|| g("vcpu", "1"));
+    let mem_mib = vars.get("mem_mib").cloned().unwrap_or_else(|| g("mem_mib", "128"));
+    let pid = std::process::id();
+    let inst = vars.get("instance").map(|i| format!("-{i}")).filter(|_| vars.contains_key("instance"));
+    let sock = g("api_sock", &format!("/tmp/assayist-chv-{pid}{}.sock", inst.unwrap_or_default()));
+    CloudHypervisorTarget {
+        bin: g("bin", "cloud-hypervisor"),
+        sock,
+        vcpu,
+        mem_mib,
+        kernel: g("kernel", ""),
+        rootfs: g("rootfs", ""),
+        cmdline: g("cmdline", "console=ttyS0 reboot=k panic=1 root=/dev/vda ro"),
+        extra: g("extra_args", ""),
+        readiness: config.get("readiness").map(|_| g("readiness", "")),
+        pin_threads,
+        spans: RefCell::new(Vec::new()),
+    }
+}
+
+impl CloudHypervisorTarget {
+    /// Launch cloud-hypervisor in a fresh scratch cwd (wiped per launch, as the
+    /// firecracker and qemu adapters do), backgrounded, recording its pid and
+    /// waiting for the api socket to appear. Guest console is routed into the
+    /// log so a failed boot is visible.
+    fn launch_cmd(&self) -> String {
+        format!(
+            "rm -f '{sock}' '{sock}.pid'; wd='{sock}.d'; rm -rf \"$wd\"; mkdir -p \"$wd\"; \
+             ( cd \"$wd\" && exec '{bin}' --api-socket '{sock}' \
+               --kernel '{kernel}' --cmdline '{cmdline}' \
+               --disk path='{rootfs}',readonly=on \
+               --cpus boot='{vcpu}' --memory size='{mem}'M \
+               --serial tty --console off {extra} \
+             ) >'{sock}.log' 2>&1 & \
+             echo $! > '{sock}.pid'; \
+             for _ in $(seq 1 250); do [ -S '{sock}' ] && exit 0; sleep 0.02; done; \
+             echo 'cloud-hypervisor api socket did not appear' >&2; exit 1",
+            sock = self.sock,
+            bin = self.bin,
+            kernel = self.kernel,
+            cmdline = self.cmdline,
+            rootfs = self.rootfs,
+            vcpu = self.vcpu,
+            mem = self.mem_mib,
+            extra = self.extra,
+        )
+    }
+}
+
+impl Target for CloudHypervisorTarget {
+    fn version(&self, sh: &dyn Shell) -> String {
+        match sh.run(&format!("'{}' --version", self.bin)) {
+            Ok(out) => version_token(&out),
+            Err(_) => "cloud-hypervisor".to_string(),
+        }
+    }
+
+    fn provision(&self, sh: &dyn Shell) -> Result<(), String> {
+        // The measured span is CH coming up to its control socket.
+        let start = now_nanos();
+        sh.run(&self.launch_cmd())?;
+        let end = now_nanos();
+        self.spans.borrow_mut().push(span("boot.vmm_ready", None, start, end));
+        Ok(())
+    }
+
+    fn start(&self, _sh: &dyn Shell) -> Result<(), String> {
+        // CH boots the guest at launch; nothing to start.
+        Ok(())
+    }
+
+    fn reach_steady(&self, sh: &dyn Shell) -> Result<(), String> {
+        if self.pin_threads {
+            return Err("pin_threads is not supported for the cloud-hypervisor target yet".into());
+        }
+        if let Some(cmd) = &self.readiness {
+            if !cmd.trim().is_empty() {
+                sh.run(cmd)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn spans(&self, _sh: &dyn Shell) -> Result<Vec<Value>, String> {
+        Ok(self.spans.borrow().clone())
+    }
+
+    fn teardown(&self, sh: &dyn Shell) -> Result<(), String> {
+        // Unlike firecracker/qemu, Cloud Hypervisor does not exit when the guest
+        // resets: it keeps rebooting the guest and holds a flock on
+        // `<api-socket>.lock`. So we must wait for it to actually die before the
+        // next run reuses the socket, else CH-b fails with ApiSocketInUse while
+        // CH-a is still winding down (it can be slow to answer SIGTERM while the
+        // vcpu spins). SIGTERM, wait bounded for exit, SIGKILL as a backstop,
+        // then remove the socket, lock, pid, log, and scratch. `rm -rf` is last
+        // and always succeeds, so a stale or missing pid is not fatal.
+        let cmd = format!(
+            "p=\"$(cat '{sock}.pid' 2>/dev/null)\"; \
+             if [ -n \"$p\" ]; then kill \"$p\" 2>/dev/null; \
+               for _ in $(seq 1 250); do kill -0 \"$p\" 2>/dev/null || break; sleep 0.02; done; \
+               kill -9 \"$p\" 2>/dev/null; fi; \
+             rm -rf '{sock}' '{sock}.lock' '{sock}.log' '{sock}.pid' '{sock}.d'",
+            sock = self.sock
+        );
+        sh.run(&cmd).map(|_| ())
+    }
+}
+
 // --- fio workload -----------------------------------------------------------
 
 /// An fio job run to completion inside the capture window. `start` runs fio with
@@ -1078,6 +1218,47 @@ mod tests {
     #[test]
     fn qemu_pinning_is_rejected_for_now() {
         let t = qemu_target(&config(&[("kernel", json!("/k"))]), &vars(&[]), true);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        assert!(t.reach_steady(&sh).unwrap_err().contains("pin_threads"));
+    }
+
+    #[test]
+    fn ch_provision_launches_vmm_and_records_boot_span() {
+        let cfg = config(&[
+            ("kernel", json!("/k/vmlinux")),
+            ("rootfs", json!("/r/root.ext4")),
+            ("api_sock", json!("/tmp/ch.sock")),
+        ]);
+        let t = ch_target(&cfg, &vars(&[("vcpu", "2"), ("mem_mib", "512")]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        t.start(&sh).unwrap();
+
+        let launch = sh.first_containing("api-socket").expect("launched");
+        assert!(launch.contains("--api-socket '/tmp/ch.sock'"));
+        assert!(launch.contains("--cpus boot='2'") && launch.contains("--memory size='512'M"));
+        assert!(launch.contains("--kernel '/k/vmlinux'"));
+        assert!(launch.contains("--disk path='/r/root.ext4',readonly=on"));
+
+        let spans = t.spans(&sh).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "boot.vmm_ready");
+    }
+
+    #[test]
+    fn ch_default_socket_carries_the_instance_index() {
+        let mut v = vars(&[]);
+        v.insert("instance".into(), "3".into());
+        let t = ch_target(&config(&[("kernel", json!("/k"))]), &v, false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        assert!(sh.seen.borrow().iter().any(|c| c.contains("-3.sock")));
+    }
+
+    #[test]
+    fn ch_pinning_is_rejected_for_now() {
+        let t = ch_target(&config(&[("kernel", json!("/k"))]), &vars(&[]), true);
         let sh = FakeShell::new();
         t.provision(&sh).unwrap();
         assert!(t.reach_steady(&sh).unwrap_err().contains("pin_threads"));

@@ -30,13 +30,15 @@ use adapter::{Target, Workload};
 use assayist_contract::Grade;
 use def::BenchmarkDef;
 
-/// Pick a target adapter by name. `firecracker` is the native adapter; anything
-/// else falls back to the command adapter (shell templates from the def).
-/// `pin_threads` comes from `host_prep`; only the native target acts on it.
+/// Pick a target adapter by name. `firecracker`, `qemu`, and `cloud-hypervisor`
+/// (alias `chv`) are native adapters; anything else falls back to the command
+/// adapter (shell templates from the def). `pin_threads` comes from `host_prep`;
+/// only the firecracker target acts on it today.
 fn select_target(def: &BenchmarkDef, vars: BTreeMap<String, String>, pin_threads: bool) -> Box<dyn Target> {
     match def.target.adapter.as_str() {
         "firecracker" => Box::new(native::firecracker_target(&def.target.config, &vars, pin_threads)),
         "qemu" => Box::new(native::qemu_target(&def.target.config, &vars, pin_threads)),
+        "cloud-hypervisor" | "chv" => Box::new(native::ch_target(&def.target.config, &vars, pin_threads)),
         _ => Box::new(adapter::command_target(def, vars)),
     }
 }

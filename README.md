@@ -38,7 +38,7 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | built and run: captured run-queue latency from the sched tracepoints; flags `over_budget` when unscoped, scope with `--cgroup` |
 | OTLP export + import (`crates/otlp`) | built, tested; wired as `assayist export` / `import` |
 | `crates/orchestrate` (run defs -> host prep -> capture -> assemble -> gate) | v0 built: `run`/`capture`/`inspect`/`export`/`import` |
-| native adapters: `firecracker` + `qemu` targets, `fio` + `wrk` + `vsock` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk, `vsock` drove a restored microVM's function server, `qemu` cold-booted a full VM whose KVM exits the kvm gadget captured unchanged |
+| native adapters: `firecracker` + `qemu` + `cloud-hypervisor` targets, `fio` + `wrk` + `vsock` workloads (`crates/orchestrate/src/native.rs`) | built, tested; firecracker + fio validated on real KVM, wrk against real wrk, `vsock` drove a restored microVM's function server, `qemu` and `cloud-hypervisor` cold-booted full VMs whose KVM exits the kvm gadget captured unchanged |
 
 Verified by execution: the core (contract, gate, OTLP round-trip), and the whole pipeline end-to-end on a nested-KVM host. The kvm gadget captured a live Firecracker microVM's exits, the firecracker/fio/wrk adapters drove real runs, and a fully-prepped, vCPU-pinned run graded `reproducible`. The block gadget captured per-device I/O latency over a cold snapshot restore in the same run as the kvm gadget. The ctrlplane gadget captured run-queue latency from the scheduler tracepoints, and the net gadget attached XDP and emitted (real packet counts need a tap/NIC). Every capture gadget has now been built and run on a BTF host; they each need clang and bpftool to build per-host.
 
@@ -254,6 +254,22 @@ target:
 ```
 
 The host-side capture plane is VMM-agnostic: the same kvm gadget captured a QEMU guest's exits (HLT, MSR_WRITE, CR_ACCESS, ...) unchanged. A full VM is chattier than a microVM, so on this host the kvm probe ran just over its default 0.01-core budget and the run graded `contaminated`, the observer-effect check doing its job; raise the gadget's `--budget` for a full VM. Concurrency (`instances`), the host-memory delta, and residency all work through the generic paths, so N-sandbox QEMU runs come for free.
+
+### Full VMs (Cloud Hypervisor)
+
+`target.adapter: cloud-hypervisor` (alias `chv`) cold-boots a Cloud Hypervisor VM, timing it up to its `--api-socket` appearing as `boot.vmm_ready`, the same host-observable marker the qemu adapter uses. It direct-boots an uncompressed `vmlinux`, the same kernel image the firecracker adapter takes, so a firecracker-vs-CH or qemu-vs-CH compare shares kernel and rootfs. It is v0: cold boot only (CH snapshot/restore and vCPU pinning are not wired yet).
+
+```yaml
+target:
+  adapter: cloud-hypervisor
+  config:
+    bin: "{def_dir}/../cloud-hypervisor"
+    kernel: "{def_dir}/../vmlinux-guest"
+    rootfs: "{def_dir}/../rootfs.ext4"
+    cmdline: "console=ttyS0 root=/dev/vda ro"
+```
+
+Unlike firecracker and qemu, CH does not exit when the guest resets: it keeps rebooting the guest and holds a flock on `<api-socket>.lock`, so teardown waits for the process to die before the next run reuses the socket (else a repeat run fails with `ApiSocketInUse`). Validated: CH v53.0 booted the firecracker `vmlinux` + `.ext4` rootfs, `boot.vmm_ready` ~47ms, and the kvm gadget captured its exits (IO_INSTRUCTION, EPT_VIOLATION, HLT, MSR_WRITE, ...) unchanged, a third VMM through the same capture plane.
 
 ## The contract is the load-bearing piece
 
