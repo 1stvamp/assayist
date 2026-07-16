@@ -269,6 +269,21 @@ impl Target for FanoutTarget {
         }
         last
     }
+    fn pinning_layout(&self) -> Option<Value> {
+        // Merge the instances' layouts as {"instance0": {...}, ...}. None unless
+        // at least one instance pinned, so an unpinned fanout stays unpinned.
+        let mut map = serde_json::Map::new();
+        for (i, t) in self.inners.iter().enumerate() {
+            if let Some(layout) = t.pinning_layout() {
+                map.insert(format!("instance{i}"), layout);
+            }
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(Value::Object(map))
+        }
+    }
 }
 
 /// Parse `MemAvailable` and `Cached` (both KiB) out of /proc/meminfo text.

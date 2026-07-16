@@ -59,17 +59,33 @@ fn instances_of(def: &BenchmarkDef, vars: &BTreeMap<String, String>) -> u32 {
 /// Build the run's target. One instance is the plain adapter target; N > 1 wraps
 /// N of them (each with a distinct `{instance}` var, so their sockets/dirs do
 /// not collide) in a `FanoutTarget`, which is where concurrency lives so every
-/// adapter gets it. Pinning is not combined with fanout, so inners are unpinned.
+/// adapter gets it. When pinning is on, each instance gets a distinct `cpu_base`
+/// (instance i starts at i * vcpu) so concurrent sandboxes pin to disjoint CPUs;
+/// `taskset` fails the run if that would need more CPUs than exist.
 fn build_target(def: &BenchmarkDef, vars: BTreeMap<String, String>, pin_threads: bool) -> Box<dyn Target> {
     let n = instances_of(def, &vars);
     if n <= 1 {
         return select_target(def, vars, pin_threads);
     }
+    let vcpu: u32 = vars
+        .get("vcpu")
+        .cloned()
+        .or_else(|| match def.target.config.get("vcpu") {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(other) => Some(other.to_string()),
+            None => None,
+        })
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
     let inners = (0..n)
         .map(|i| {
             let mut v = vars.clone();
             v.insert("instance".to_string(), i.to_string());
-            select_target(def, v, false)
+            if pin_threads {
+                v.insert("cpu_base".to_string(), (i * vcpu).to_string());
+            }
+            select_target(def, v, pin_threads)
         })
         .collect();
     Box::new(adapter::FanoutTarget::new(inners))
