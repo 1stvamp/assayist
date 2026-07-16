@@ -205,6 +205,26 @@ target:
 
 Concurrency is an orchestration concern, not a firecracker one: N > 1 wraps N single-instance targets in a fanout that drives them all through the lifecycle and records one aggregate `restore.resume_to_steady` span (so a 1-vs-N comparison lines up on the same metric). Each instance is built with a distinct `{instance}` var, so any adapter gets non-colliding sockets and scratch dirs from it: the firecracker adapter folds `{instance}` into its default API socket, and a command-adapter def references `{instance}` in its own templates. So the same knob works for a future QEMU or Cloud Hypervisor adapter with no extra code. Pinning is not combined with fanout (instances run unpinned).
 
+### Memory backend: file-backed vs userfaultfd
+
+`mem_backend: uffd` restores guest memory from an external userfaultfd handler instead of mmapping the mem file (`mem_backend: file`, the default). File-backed sandboxes share resident pages through the host page cache, so their aggregate memory stays roughly flat as instances grow; a userfaultfd handler that copies pages into each sandbox's own anonymous memory (the REAP baseline) has no such sharing, so it grows with the count. The adapter is generic: it launches whatever `uffd_handler` command the def gives, rendering `{uffd_uds}` (the socket Firecracker connects to) and `{mem_file}`, waits for the socket, then loads with the `Uffd` backend.
+
+```yaml
+compare: backend
+parameterise:
+  backend: [file, uffd]
+target:
+  adapter: firecracker
+  config:
+    instances: "4"
+    from_snapshot: "{def_dir}/../run/fn/snapshot"
+    mem_file: "{def_dir}/../run/fn/mem"
+    mem_backend: "{backend}"
+    uffd_handler: "/path/to/handler --uds {uffd_uds} --mem {mem_file} ondemand"
+```
+
+Combined with `instances`, this measures dedup directly: on one host, four file-backed sandboxes consumed ~1 MB of `hostmem.mem_consumed_kib` while four userfaultfd sandboxes of the same snapshot consumed ~21 MB. The handler is torn down with the run.
+
 ## The contract is the load-bearing piece
 
 Everything agrees on one record shape, so it is the thing designed most carefully and the most expensive to change once published. It is drawn OTLP-shaped where concepts overlap (a 128-bit `run_id` becomes an OTLP `trace_id`; log2 histograms map to OTel exponential histograms at scale 0), so an OTLP import/export plugin is a rote transform rather than a rewrite. Three concepts have no OTLP equivalent and stay native because they enforce the guarantees: the host fingerprint (reproducibility), the cardinality budget (density-safety), and the observer-effect self-metrics (the low-overhead claim, carried by the ProbeCost numbers that back it up). The self-metrics are gated: a probe that runs over its budget marks the run contaminated, so the overhead claim is checked at grade time rather than taken on faith. Read [`docs/contract-v0.md`](docs/contract-v0.md) before changing the schema.
