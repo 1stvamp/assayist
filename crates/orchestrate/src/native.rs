@@ -698,6 +698,151 @@ impl Target for CloudHypervisorTarget {
     }
 }
 
+
+/// A unikernel target: boots a single self-contained unikernel image under
+/// QEMU/KVM and times it up to a QMP control socket appearing as
+/// `boot.vmm_ready`, the same host-observable marker the qemu and CH adapters
+/// use. A unikernel is the archetypal agentless guest (one address space, no
+/// userspace to log into), which is exactly the vantage assayist is built for:
+/// the kvm/net gadgets see its exits and packets host-side. Two boot styles:
+/// `disk` (a raw disk image, e.g. Nanos/ops output; the default) and `kernel`
+/// (a multiboot/PVH kernel image via `-kernel`, e.g. Unikraft). An optional
+/// `hostfwd` maps a host port to a guest port so a `readiness` probe can reach
+/// the guest, the only agentless way to confirm it is actually serving.
+///
+/// v0 is cold boot only: no snapshot/restore, no vCPU pinning.
+pub struct UnikernelTarget {
+    bin: String,
+    sock: String,
+    mem_mib: String,
+    image: String,
+    disk_boot: bool,
+    boot_args: String,
+    hostfwd: String,
+    extra: String,
+    readiness: Option<String>,
+    pin_threads: bool,
+    spans: RefCell<Vec<Value>>,
+}
+
+pub fn unikernel_target(
+    config: &BTreeMap<String, Value>,
+    vars: &BTreeMap<String, String>,
+    pin_threads: bool,
+) -> UnikernelTarget {
+    let g = |k: &str, d: &str| cfg(config, vars, k, d);
+    let mem_mib = vars.get("mem_mib").cloned().unwrap_or_else(|| g("mem_mib", "256"));
+    let pid = std::process::id();
+    let inst = vars.get("instance").map(|i| format!("-{i}")).filter(|_| vars.contains_key("instance"));
+    let sock = g("qmp_sock", &format!("/tmp/assayist-uk-{pid}{}.sock", inst.unwrap_or_default()));
+    // `disk` (raw disk image, the Nanos/ops shape) is the default; `kernel`
+    // boots a multiboot/PVH image via -kernel (the Unikraft shape).
+    let disk_boot = !matches!(g("boot_style", "disk").as_str(), "kernel");
+    UnikernelTarget {
+        bin: g("bin", "qemu-system-x86_64"),
+        sock,
+        mem_mib,
+        image: g("image", ""),
+        disk_boot,
+        boot_args: g("boot_args", ""),
+        hostfwd: g("hostfwd", ""),
+        extra: g("extra_args", ""),
+        readiness: config.get("readiness").map(|_| g("readiness", "")),
+        pin_threads,
+        spans: RefCell::new(Vec::new()),
+    }
+}
+
+impl UnikernelTarget {
+    /// Launch qemu in a fresh scratch cwd (wiped per launch, as the firecracker
+    /// and qemu adapters do) booting the unikernel image, backgrounded, with a
+    /// QMP socket, recording its pid and waiting for the socket to appear.
+    fn launch_cmd(&self) -> String {
+        let boot = if self.disk_boot {
+            format!(
+                "-drive file='{img}',format=raw,if=none,id=hd0 -device virtio-blk-pci,drive=hd0",
+                img = self.image
+            )
+        } else {
+            format!("-kernel '{img}' -append '{args}'", img = self.image, args = self.boot_args)
+        };
+        // Optional user-mode networking with a host->guest port forward, so a
+        // readiness probe can reach the agentless guest.
+        let net = if self.hostfwd.trim().is_empty() {
+            String::new()
+        } else {
+            format!("-netdev user,id=n0,hostfwd={} -device virtio-net-pci,netdev=n0", self.hostfwd)
+        };
+        format!(
+            "rm -f '{sock}' '{sock}.pid'; wd='{sock}.d'; rm -rf \"$wd\"; mkdir -p \"$wd\"; \
+             ( cd \"$wd\" && exec '{bin}' -machine q35 -enable-kvm -cpu host -m '{mem}' \
+               {boot} {net} \
+               -qmp unix:'{sock}',server,nowait -nographic -serial file:'{sock}.serial' -no-reboot {extra} \
+             ) >'{sock}.log' 2>&1 & \
+             echo $! > '{sock}.pid'; \
+             for _ in $(seq 1 250); do [ -S '{sock}' ] && exit 0; sleep 0.02; done; \
+             echo 'unikernel qmp socket did not appear' >&2; exit 1",
+            sock = self.sock,
+            bin = self.bin,
+            mem = self.mem_mib,
+            boot = boot,
+            net = net,
+            extra = self.extra,
+        )
+    }
+}
+
+impl Target for UnikernelTarget {
+    fn version(&self, sh: &dyn Shell) -> String {
+        match sh.run(&format!("'{}' --version", self.bin)) {
+            Ok(out) => version_token(&out),
+            Err(_) => "qemu".to_string(),
+        }
+    }
+
+    fn provision(&self, sh: &dyn Shell) -> Result<(), String> {
+        // The measured span is qemu coming up to its control socket, about to
+        // run the unikernel.
+        let start = now_nanos();
+        sh.run(&self.launch_cmd())?;
+        let end = now_nanos();
+        self.spans.borrow_mut().push(span("boot.vmm_ready", None, start, end));
+        Ok(())
+    }
+
+    fn start(&self, _sh: &dyn Shell) -> Result<(), String> {
+        // The VMM boots the unikernel at launch; nothing to start.
+        Ok(())
+    }
+
+    fn reach_steady(&self, sh: &dyn Shell) -> Result<(), String> {
+        if self.pin_threads {
+            return Err("pin_threads is not supported for the unikernel target yet".into());
+        }
+        // A unikernel has no in-guest agent, so the only steady signal is
+        // host-observable: an author-supplied probe against a forwarded port.
+        if let Some(cmd) = &self.readiness {
+            if !cmd.trim().is_empty() {
+                sh.run(cmd)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn spans(&self, _sh: &dyn Shell) -> Result<Vec<Value>, String> {
+        Ok(self.spans.borrow().clone())
+    }
+
+    fn teardown(&self, sh: &dyn Shell) -> Result<(), String> {
+        let cmd = format!(
+            "[ -f '{sock}.pid' ] && kill \"$(cat '{sock}.pid')\" 2>/dev/null; \
+             rm -rf '{sock}' '{sock}.log' '{sock}.serial' '{sock}.pid' '{sock}.d'",
+            sock = self.sock
+        );
+        sh.run(&cmd).map(|_| ())
+    }
+}
+
 // --- fio workload -----------------------------------------------------------
 
 /// An fio job run to completion inside the capture window. `start` runs fio with
@@ -1294,6 +1439,79 @@ mod tests {
     #[test]
     fn ch_pinning_is_rejected_for_now() {
         let t = ch_target(&config(&[("kernel", json!("/k"))]), &vars(&[]), true);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        assert!(t.reach_steady(&sh).unwrap_err().contains("pin_threads"));
+    }
+
+    #[test]
+    fn unikernel_disk_boot_uses_a_raw_virtio_drive() {
+        let cfg = config(&[("image", json!("/img/hello-uk")), ("qmp_sock", json!("/tmp/uk.sock"))]);
+        let t = unikernel_target(&cfg, &vars(&[("mem_mib", "256")]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        t.start(&sh).unwrap();
+
+        let launch = sh.first_containing("qmp").expect("launched");
+        assert!(launch.contains("-drive file='/img/hello-uk',format=raw"));
+        assert!(launch.contains("virtio-blk-pci"));
+        assert!(!launch.contains("-kernel"));
+        assert!(launch.contains("-qmp unix:'/tmp/uk.sock'"));
+
+        let spans = t.spans(&sh).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "boot.vmm_ready");
+    }
+
+    #[test]
+    fn unikernel_kernel_boot_uses_dash_kernel() {
+        let cfg = config(&[
+            ("image", json!("/img/unikraft")),
+            ("boot_style", json!("kernel")),
+            ("boot_args", json!("netdev.ip=...")),
+        ]);
+        let t = unikernel_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        let launch = sh.first_containing("qmp").expect("launched");
+        assert!(launch.contains("-kernel '/img/unikraft'"));
+        assert!(launch.contains("-append 'netdev.ip=...'"));
+        assert!(!launch.contains("virtio-blk-pci"));
+    }
+
+    #[test]
+    fn unikernel_hostfwd_adds_user_networking() {
+        let with = unikernel_target(
+            &config(&[("image", json!("/i")), ("hostfwd", json!("tcp::18080-:8080"))]),
+            &vars(&[]),
+            false,
+        );
+        let sh = FakeShell::new();
+        with.provision(&sh).unwrap();
+        let launch = sh.first_containing("qmp").expect("launched");
+        assert!(launch.contains("hostfwd=tcp::18080-:8080"));
+        assert!(launch.contains("virtio-net-pci"));
+
+        // No hostfwd => no networking flags.
+        let without = unikernel_target(&config(&[("image", json!("/i"))]), &vars(&[]), false);
+        let sh2 = FakeShell::new();
+        without.provision(&sh2).unwrap();
+        assert!(!sh2.first_containing("qmp").unwrap().contains("netdev"));
+    }
+
+    #[test]
+    fn unikernel_default_socket_carries_the_instance_index() {
+        let mut v = vars(&[]);
+        v.insert("instance".into(), "2".into());
+        let t = unikernel_target(&config(&[("image", json!("/i"))]), &v, false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        assert!(sh.seen.borrow().iter().any(|c| c.contains("-2.sock")));
+    }
+
+    #[test]
+    fn unikernel_pinning_is_rejected_for_now() {
+        let t = unikernel_target(&config(&[("image", json!("/i"))]), &vars(&[]), true);
         let sh = FakeShell::new();
         t.provision(&sh).unwrap();
         assert!(t.reach_steady(&sh).unwrap_err().contains("pin_threads"));
