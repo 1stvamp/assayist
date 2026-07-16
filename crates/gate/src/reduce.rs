@@ -35,6 +35,12 @@ pub fn polarity_of(id: &str, unit: &str) -> Polarity {
     {
         return Polarity::HigherBetter;
     }
+    // Memory consumed to reach steady: using less is better. Deliberately ahead
+    // of the throughput/bytes rule so a "*_kib"/"mem" consumption metric is not
+    // misread as higher-better.
+    if l.contains("mem_consumed") || l.contains("memory_consumed") || l.contains("rss") {
+        return Polarity::LowerBetter;
+    }
     // CPU-consumption metrics are genuinely ambiguous (more scheduled time can
     // be fine or a sign of inefficiency); do not guess a direction.
     if l.contains("on_cpu") || l.contains("utilis") || l.contains("cpu_ns") {
@@ -250,6 +256,13 @@ pub fn reduce(run: &Value) -> Vec<Metric> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn memory_consumed_is_lower_better() {
+        assert_eq!(polarity_of("hostmem.mem_consumed_kib", "KiBy"), Polarity::LowerBetter);
+        // Page-cache delta has no graded direction (sharing vs growth).
+        assert_eq!(polarity_of("hostmem.cached_delta_kib", "KiBy"), Polarity::Unknown);
+    }
 
     #[test]
     fn workload_report_numbers_become_gradeable_metrics() {
