@@ -106,6 +106,16 @@ pub struct FirecrackerTarget {
     /// state the restore starts from: drop caches for a cold baseline, or warm a
     /// captured working set (e.g. `bpfoliod prefetch`) so resume faults hit cache.
     pre_restore: Option<String>,
+    /// Memory backend for restore: "File" (default) mmaps the mem file, so
+    /// concurrent instances share resident pages through the page cache; "Uffd"
+    /// serves guest memory from an external userfaultfd handler, so each instance
+    /// gets its own anonymous copy (no page-cache dedup). The REAP baseline.
+    mem_backend: String,
+    /// Command template launching the userfaultfd handler for `mem_backend:
+    /// uffd`, backgrounded before `snapshot/load`. Rendered with `{uffd_uds}`
+    /// (the socket Firecracker connects to) and `{mem_file}`, e.g.
+    /// `bpfolio-reap --uds {uffd_uds} --mem {mem_file} ondemand`.
+    uffd_handler: Option<String>,
     /// Pin each vCPU thread to a dedicated logical CPU and record the layout.
     pin_threads: bool,
     spans: RefCell<Vec<Value>>,
@@ -138,6 +148,11 @@ pub fn firecracker_target(
         .map(|_| (g("snapshot_out", ""), g("snapshot_mem", "")));
     let readiness = config.get("readiness").map(|_| g("readiness", ""));
     let pre_restore = config.get("pre_restore").map(|_| g("pre_restore", ""));
+    let mem_backend = match g("mem_backend", "File").to_lowercase().as_str() {
+        "uffd" => "Uffd".to_string(),
+        _ => "File".to_string(),
+    };
+    let uffd_handler = config.get("uffd_handler").map(|_| g("uffd_handler", ""));
 
     FirecrackerTarget {
         bin: g("bin", "firecracker"),
@@ -152,6 +167,8 @@ pub fn firecracker_target(
         snapshot_out,
         readiness,
         pre_restore,
+        mem_backend,
+        uffd_handler,
         pin_threads,
         spans: RefCell::new(Vec::new()),
         pinning: RefCell::new(None),
@@ -179,6 +196,29 @@ impl FirecrackerTarget {
              echo 'firecracker api socket did not appear' >&2; exit 1",
             sock = self.sock,
             bin = self.bin,
+        )
+    }
+
+    /// The socket Firecracker's `Uffd` backend connects to, derived from the API
+    /// socket so it is unique per instance.
+    fn uffd_uds(&self) -> String {
+        format!("{}.uffd", self.sock)
+    }
+
+    /// Launch the userfaultfd handler in the background and wait for its socket,
+    /// so it is listening before `snapshot/load`. The handler template is
+    /// rendered with `{uffd_uds}` and `{mem_file}`; its pid is recorded for
+    /// teardown.
+    fn launch_uffd_cmd(&self, handler: &str, uds: &str, mem: &str) -> String {
+        let mut v = BTreeMap::new();
+        v.insert("uffd_uds".to_string(), uds.to_string());
+        v.insert("mem_file".to_string(), mem.to_string());
+        let handler = render(handler, &v);
+        format!(
+            "rm -f '{uds}' '{uds}.pid'; ( {handler} ) >'{uds}.log' 2>&1 & \
+             echo $! > '{uds}.pid'; \
+             for _ in $(seq 1 200); do [ -S '{uds}' ] && exit 0; sleep 0.05; done; \
+             echo 'uffd handler socket did not appear' >&2; exit 1"
         )
     }
 
@@ -247,10 +287,25 @@ impl Target for FirecrackerTarget {
                     sh.run(cmd)?;
                 }
             }
+            // Pick the memory backend. Uffd serves guest RAM from an external
+            // handler (launched here, listening before load); File mmaps the mem
+            // file. The handler must be up before snapshot/load connects to it.
+            let backend = if self.mem_backend == "Uffd" {
+                let handler = self
+                    .uffd_handler
+                    .as_deref()
+                    .filter(|h| !h.trim().is_empty())
+                    .ok_or("mem_backend: uffd needs a uffd_handler command")?;
+                let uds = self.uffd_uds();
+                sh.run(&self.launch_uffd_cmd(handler, &uds, mem))?;
+                json!({"backend_type": "Uffd", "backend_path": uds})
+            } else {
+                json!({"backend_type": "File", "backend_path": mem})
+            };
             // Restore mode: load resumes the VM; that is the measured span.
             let body = json!({
                 "snapshot_path": snap,
-                "mem_backend": {"backend_path": mem, "backend_type": "File"},
+                "mem_backend": backend,
                 "resume_vm": true,
             })
             .to_string();
@@ -335,10 +390,14 @@ impl Target for FirecrackerTarget {
         // succeeds, so a stale or missing pid is not fatal. Killing by pid (not
         // by command-line match) avoids SIGTERMing the shell that runs this very
         // command.
+        // Also stop the uffd handler if one was launched (harmless no-op in File
+        // mode: the pidfile does not exist and `rm -rf` always succeeds).
         let cmd = format!(
             "[ -f '{sock}.pid' ] && kill \"$(cat '{sock}.pid')\" 2>/dev/null; \
-             rm -rf '{sock}' '{sock}.log' '{sock}.pid' '{sock}.d'",
-            sock = self.sock
+             [ -f '{uds}.pid' ] && kill \"$(cat '{uds}.pid')\" 2>/dev/null; \
+             rm -rf '{sock}' '{sock}.log' '{sock}.pid' '{sock}.d' '{uds}' '{uds}.log' '{uds}.pid'",
+            sock = self.sock,
+            uds = self.uffd_uds(),
         );
         sh.run(&cmd).map(|_| ())
     }
@@ -812,6 +871,39 @@ mod tests {
         // The per-instance socket is discriminated so concurrent instances of
         // one def do not collide.
         assert!(sh2.seen.borrow().iter().any(|c| c.contains("-2.sock")));
+    }
+
+    #[test]
+    fn firecracker_uffd_launches_handler_and_loads_uffd_backend() {
+        let cfg = config(&[
+            ("from_snapshot", json!("/s/snap")),
+            ("mem_file", json!("/s/mem")),
+            ("api_sock", json!("/tmp/p.sock")),
+            ("mem_backend", json!("uffd")),
+            ("uffd_handler", json!("reap --uds {uffd_uds} --mem {mem_file} ondemand")),
+        ]);
+        let t = firecracker_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+
+        let seen = sh.seen.borrow();
+        // The handler is launched on the derived uffd socket, with mem_file
+        // substituted, before the snapshot load...
+        assert!(seen.iter().any(|c| c.contains("reap --uds /tmp/p.sock.uffd --mem /s/mem ondemand")));
+        // ...and the load uses the Uffd backend pointing at that socket.
+        assert!(seen.iter().any(|c| c.contains("/snapshot/load") && c.contains("\"backend_type\":\"Uffd\"") && c.contains("/tmp/p.sock.uffd")));
+    }
+
+    #[test]
+    fn firecracker_uffd_without_handler_is_an_error() {
+        let cfg = config(&[
+            ("from_snapshot", json!("/s/snap")),
+            ("mem_file", json!("/s/mem")),
+            ("mem_backend", json!("uffd")),
+        ]);
+        let t = firecracker_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        assert!(t.provision(&sh).unwrap_err().contains("uffd_handler"));
     }
 
     #[test]
