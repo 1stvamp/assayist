@@ -85,7 +85,7 @@ Named, timestamped intervals. Deliberately OTLP-span-shaped.
 
 | Field | Type | Req | OTLP span mapping |
 |---|---|---|---|
-| `name` | string | MUST | `span.name`, e.g. `boot.api_to_init`, `snapshot.serialise`, `restore.resume_to_steady`. |
+| `name` | string | MUST | `span.name`, e.g. `boot.vmm_ready`, `snapshot.serialise`, `restore.resume_to_steady`. |
 | `start_unix_nano` | uint64 | MUST | span start. |
 | `end_unix_nano` | uint64 | MUST | span end. |
 | `parent` | string (span name) | MAY | Resolves to `parent_span_id` on export. |
