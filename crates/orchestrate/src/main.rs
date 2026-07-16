@@ -36,6 +36,7 @@ use def::BenchmarkDef;
 fn select_target(def: &BenchmarkDef, vars: BTreeMap<String, String>, pin_threads: bool) -> Box<dyn Target> {
     match def.target.adapter.as_str() {
         "firecracker" => Box::new(native::firecracker_target(&def.target.config, &vars, pin_threads)),
+        "qemu" => Box::new(native::qemu_target(&def.target.config, &vars, pin_threads)),
         _ => Box::new(adapter::command_target(def, vars)),
     }
 }

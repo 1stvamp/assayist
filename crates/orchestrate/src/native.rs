@@ -407,6 +407,134 @@ impl Target for FirecrackerTarget {
     }
 }
 
+// --- qemu target ------------------------------------------------------------
+
+/// A QEMU/KVM full-VM target (cold boot). It launches `qemu-system` with a QMP
+/// control socket and times the VM up to that socket appearing
+/// (`boot.vmm_ready`): the VMM is initialised and about to run the guest. Like
+/// the firecracker adapter's `boot.api_to_init`, this is a host-observable
+/// marker, not guest userspace init, which an agentless vantage cannot see; an
+/// optional `readiness` command bridges to a guest-ready signal when the def has
+/// one. Concurrency, host-memory, and residency capture all work through the
+/// generic paths, so N-sandbox QEMU runs come for free.
+///
+/// v0 is cold boot only: QEMU snapshot/restore (savevm/migration) and vCPU
+/// pinning are not wired yet.
+pub struct QemuTarget {
+    bin: String,
+    sock: String,
+    vcpu: String,
+    mem_mib: String,
+    kernel: String,
+    rootfs: String,
+    boot_args: String,
+    extra: String,
+    readiness: Option<String>,
+    pin_threads: bool,
+    spans: RefCell<Vec<Value>>,
+}
+
+pub fn qemu_target(
+    config: &BTreeMap<String, Value>,
+    vars: &BTreeMap<String, String>,
+    pin_threads: bool,
+) -> QemuTarget {
+    let g = |k: &str, d: &str| cfg(config, vars, k, d);
+    let vcpu = vars.get("vcpu").cloned().unwrap_or_else(|| g("vcpu", "1"));
+    let mem_mib = vars.get("mem_mib").cloned().unwrap_or_else(|| g("mem_mib", "128"));
+    let pid = std::process::id();
+    let inst = vars.get("instance").map(|i| format!("-{i}")).filter(|_| vars.contains_key("instance"));
+    let sock = g("qmp_sock", &format!("/tmp/assayist-qemu-{pid}{}.sock", inst.unwrap_or_default()));
+    QemuTarget {
+        bin: g("bin", "qemu-system-x86_64"),
+        sock,
+        vcpu,
+        mem_mib,
+        kernel: g("kernel", ""),
+        rootfs: g("rootfs", ""),
+        boot_args: g("boot_args", "console=ttyS0 reboot=k panic=1 root=/dev/vda ro"),
+        extra: g("extra_args", ""),
+        readiness: config.get("readiness").map(|_| g("readiness", "")),
+        pin_threads,
+        spans: RefCell::new(Vec::new()),
+    }
+}
+
+impl QemuTarget {
+    /// Launch qemu-system in a fresh scratch cwd (wiped per launch, as the
+    /// firecracker adapter does) with a QMP unix socket, backgrounded, recording
+    /// its pid and waiting for the socket to appear.
+    fn launch_cmd(&self) -> String {
+        format!(
+            "rm -f '{sock}' '{sock}.pid'; wd='{sock}.d'; rm -rf \"$wd\"; mkdir -p \"$wd\"; \
+             ( cd \"$wd\" && exec '{bin}' -enable-kvm -m '{mem}' -smp '{vcpu}' \
+               -kernel '{kernel}' -append '{boot_args}' \
+               -drive file='{rootfs}',format=raw,if=virtio,readonly=on \
+               -qmp unix:'{sock}',server,nowait -display none -serial none -no-reboot {extra} \
+             ) >'{sock}.log' 2>&1 & \
+             echo $! > '{sock}.pid'; \
+             for _ in $(seq 1 250); do [ -S '{sock}' ] && exit 0; sleep 0.02; done; \
+             echo 'qemu qmp socket did not appear' >&2; exit 1",
+            sock = self.sock,
+            bin = self.bin,
+            mem = self.mem_mib,
+            vcpu = self.vcpu,
+            kernel = self.kernel,
+            boot_args = self.boot_args,
+            rootfs = self.rootfs,
+            extra = self.extra,
+        )
+    }
+}
+
+impl Target for QemuTarget {
+    fn version(&self, sh: &dyn Shell) -> String {
+        match sh.run(&format!("'{}' --version", self.bin)) {
+            Ok(out) => version_token(&out),
+            Err(_) => "qemu".to_string(),
+        }
+    }
+
+    fn provision(&self, sh: &dyn Shell) -> Result<(), String> {
+        // The measured span is QEMU coming up to its control socket.
+        let start = now_nanos();
+        sh.run(&self.launch_cmd())?;
+        let end = now_nanos();
+        self.spans.borrow_mut().push(span("boot.vmm_ready", None, start, end));
+        Ok(())
+    }
+
+    fn start(&self, _sh: &dyn Shell) -> Result<(), String> {
+        // QEMU boots the guest at launch; nothing to start.
+        Ok(())
+    }
+
+    fn reach_steady(&self, sh: &dyn Shell) -> Result<(), String> {
+        if self.pin_threads {
+            return Err("pin_threads is not supported for the qemu target yet".into());
+        }
+        if let Some(cmd) = &self.readiness {
+            if !cmd.trim().is_empty() {
+                sh.run(cmd)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn spans(&self, _sh: &dyn Shell) -> Result<Vec<Value>, String> {
+        Ok(self.spans.borrow().clone())
+    }
+
+    fn teardown(&self, sh: &dyn Shell) -> Result<(), String> {
+        let cmd = format!(
+            "[ -f '{sock}.pid' ] && kill \"$(cat '{sock}.pid')\" 2>/dev/null; \
+             rm -rf '{sock}' '{sock}.log' '{sock}.pid' '{sock}.d'",
+            sock = self.sock
+        );
+        sh.run(&cmd).map(|_| ())
+    }
+}
+
 // --- fio workload -----------------------------------------------------------
 
 /// An fio job run to completion inside the capture window. `start` runs fio with
@@ -904,6 +1032,48 @@ mod tests {
         let t = firecracker_target(&cfg, &vars(&[]), false);
         let sh = FakeShell::new();
         assert!(t.provision(&sh).unwrap_err().contains("uffd_handler"));
+    }
+
+    #[test]
+    fn qemu_provision_launches_kvm_and_records_boot_span() {
+        let cfg = config(&[
+            ("kernel", json!("/k/vmlinux")),
+            ("rootfs", json!("/r/root.ext4")),
+            ("qmp_sock", json!("/tmp/q.sock")),
+        ]);
+        let t = qemu_target(&cfg, &vars(&[("vcpu", "2"), ("mem_mib", "512")]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        t.start(&sh).unwrap();
+
+        let launch = sh.first_containing("qmp").expect("launched");
+        assert!(launch.contains("-enable-kvm"));
+        assert!(launch.contains("-smp '2'") && launch.contains("-m '512'"));
+        assert!(launch.contains("-kernel '/k/vmlinux'"));
+        assert!(launch.contains("file='/r/root.ext4'"));
+        assert!(launch.contains("-qmp unix:'/tmp/q.sock'"));
+
+        let spans = t.spans(&sh).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "boot.vmm_ready");
+    }
+
+    #[test]
+    fn qemu_default_socket_carries_the_instance_index() {
+        let mut v = vars(&[]);
+        v.insert("instance".into(), "3".into());
+        let t = qemu_target(&config(&[("kernel", json!("/k"))]), &v, false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        assert!(sh.seen.borrow().iter().any(|c| c.contains("-3.sock")));
+    }
+
+    #[test]
+    fn qemu_pinning_is_rejected_for_now() {
+        let t = qemu_target(&config(&[("kernel", json!("/k"))]), &vars(&[]), true);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        assert!(t.reach_steady(&sh).unwrap_err().contains("pin_threads"));
     }
 
     #[test]
