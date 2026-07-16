@@ -184,6 +184,10 @@ workload:
 
 Numbers a workload reports (the `vsock` latency summary, fio's iops, or an external tool's numbers surfaced through the report) are reduced to gradeable `workload:<field>` metrics, so they are compared by the gate rather than left as inert provenance. Polarity follows the field name and unit: a `*_ns` latency reads lower-better, an `iops`/`bytes` field higher-better.
 
+### Host memory
+
+`assayist run` samples `/proc/meminfo` before the target is provisioned and again after it reaches steady, and records the deltas as `hostmem.mem_consumed_kib` (how far `MemAvailable` dropped, lower better) and `hostmem.cached_delta_kib` (page-cache change, left without a graded direction). The window is the target lifecycle, not the gadget window, so it captures the memory cost of preparing and restoring the guest. This is a host, system-level measurement: it sees the machine's memory move, not per-guest attribution, so for a single file-backed restore the signal is small and noisy (pages are shared through the page cache, which is the point). It earns its keep across many concurrent sandboxes, where the aggregate is what separates a deduped restore from a per-sandbox copy.
+
 ## The contract is the load-bearing piece
 
 Everything agrees on one record shape, so it is the thing designed most carefully and the most expensive to change once published. It is drawn OTLP-shaped where concepts overlap (a 128-bit `run_id` becomes an OTLP `trace_id`; log2 histograms map to OTel exponential histograms at scale 0), so an OTLP import/export plugin is a rote transform rather than a rewrite. Three concepts have no OTLP equivalent and stay native because they enforce the guarantees: the host fingerprint (reproducibility), the cardinality budget (density-safety), and the observer-effect self-metrics (the low-overhead claim, carried by the ProbeCost numbers that back it up). The self-metrics are gated: a probe that runs over its budget marks the run contaminated, so the overhead claim is checked at grade time rather than taken on faith. Read [`docs/contract-v0.md`](docs/contract-v0.md) before changing the schema.

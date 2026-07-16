@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use assayist_contract::Fragment;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::capture::{GadgetInvocation, GadgetRunner};
 use crate::def::BenchmarkDef;
@@ -188,6 +188,56 @@ pub struct RunArtifacts {
     pub workload_report: Value,
 }
 
+/// Parse `MemAvailable` and `Cached` (both KiB) out of /proc/meminfo text.
+/// Missing fields read as 0. `starts_with("Cached:")` deliberately does not
+/// match `SwapCached:`.
+fn parse_meminfo(text: &str) -> (i64, i64) {
+    let field = |name: &str| -> i64 {
+        text.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|n| n.parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    (field("MemAvailable:"), field("Cached:"))
+}
+
+/// Sample (MemAvailable, Cached) in KiB, through the shell seam so it is
+/// stubbable in tests.
+fn sample_meminfo(sh: &dyn Shell) -> (i64, i64) {
+    parse_meminfo(&sh.run("cat /proc/meminfo").unwrap_or_default())
+}
+
+/// A synthetic capture fragment carrying host memory deltas measured around the
+/// target lifecycle (before provision vs. after reaching steady). It is not an
+/// eBPF gadget, but it rides the same fragment path so the deltas become
+/// gradeable series. `mem_consumed_kib` is how far MemAvailable dropped reaching
+/// steady (positive = memory used, lower better). `cached_delta_kib` is the
+/// page-cache change: sharing through the page cache lowers it, growth raises
+/// it, so it is left without a graded direction. This is a host, system-level
+/// measurement: it sees the machine's memory move, not per-guest attribution,
+/// which needs the guest's own numbers.
+fn hostmem_fragment(before: (i64, i64), after: (i64, i64)) -> Fragment {
+    let gauge = |name: &str, value: i64| {
+        json!({
+            "name": name,
+            "unit": "KiBy",
+            "kind": "gauge",
+            "source": "hostmem",
+            "cardinality": {"class": "singleton"},
+            "data": {"value": value, "time_unix_nano": 0},
+        })
+    };
+    Fragment {
+        series: vec![
+            gauge("hostmem.mem_consumed_kib", before.0 - after.0),
+            gauge("hostmem.cached_delta_kib", after.1 - before.1),
+        ],
+        self_metrics: vec![],
+        capture_meta: Some(json!({"gadget": "hostmem", "source": "/proc/meminfo"})),
+    }
+}
+
 /// Drive one run: bring the target up, spawn the gadgets, run the workload
 /// across the capture window, collect fragments, then wind everything down.
 /// Gadgets are spawned before the workload starts and waited on after, so they
@@ -200,9 +250,14 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
     workload: &dyn Workload,
     gadgets: &[GadgetInvocation],
 ) -> Result<RunArtifacts, String> {
+    // Host memory before the target exists, and after it reaches steady: the
+    // delta is the memory cost of preparing and restoring the guest, measured
+    // outside the gadget window (which only opens post-steady).
+    let mem_before = sample_meminfo(sh);
     target.provision(sh)?;
     target.start(sh)?;
     target.reach_steady(sh)?;
+    let mem_after = sample_meminfo(sh);
 
     let mut handles = Vec::with_capacity(gadgets.len());
     for inv in gadgets {
@@ -236,6 +291,8 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
     let workload_report = workload.report(sh).unwrap_or(Value::Null);
     let spans = target.spans(sh)?;
     target.teardown(sh)?;
+
+    fragments.push(hostmem_fragment(mem_before, mem_after));
 
     Ok(RunArtifacts { fragments, spans, workload_report })
 }
@@ -366,19 +423,41 @@ mod tests {
         let plan = plan_gadgets(&entries, 1, Path::new("/tmp")).unwrap();
 
         let art = execute_run(&sh, &runner, &target, &workload, &plan).unwrap();
-        assert_eq!(art.fragments.len(), 1);
+        // The gadget fragment plus the synthesized hostmem fragment.
+        assert_eq!(art.fragments.len(), 2);
+        assert!(art
+            .fragments
+            .iter()
+            .any(|f| f.series.iter().any(|s| s["name"] == "hostmem.mem_consumed_kib")));
         assert_eq!(art.spans.len(), 1);
 
-        // Order: target provision/start/reach_steady, then workload start
-        // (gadgets spawn between reach_steady and workload start), then stop,
-        // then spans, then teardown.
         let seen = sh.seen.borrow().clone();
-        assert_eq!(seen[0], "provision 2"); // params rendered
-        assert_eq!(seen[1], "start"); // target start
-        assert_eq!(seen[2], "steady");
-        assert_eq!(seen[3], "load"); // workload start, after target is steady
-        assert_eq!(seen[4], "halt"); // workload stop
-        assert_eq!(seen[5], "emit-spans");
-        assert_eq!(seen[6], "teardown");
+        // Memory is sampled before the target is provisioned...
+        assert_eq!(seen[0], "cat /proc/meminfo");
+        // ...and again after it is steady, before the workload starts.
+        let steady = seen.iter().position(|c| c == "steady").unwrap();
+        let load = seen.iter().position(|c| c == "load").unwrap();
+        assert!(seen[steady + 1..load].iter().any(|c| c == "cat /proc/meminfo"));
+
+        // Lifecycle order, ignoring the two meminfo samples: target
+        // provision/start/reach_steady, then workload start (gadgets spawn in
+        // between), then stop, spans, teardown.
+        let life: Vec<&str> = seen.iter().map(String::as_str).filter(|c| *c != "cat /proc/meminfo").collect();
+        assert_eq!(life, ["provision 2", "start", "steady", "load", "halt", "emit-spans", "teardown"]);
+    }
+
+    #[test]
+    fn parse_meminfo_reads_available_and_cached_not_swapcached() {
+        let text = "MemTotal:       16000000 kB\nMemAvailable:    8000000 kB\nBuffers:          100000 kB\nCached:          2000000 kB\nSwapCached:         5000 kB\n";
+        assert_eq!(parse_meminfo(text), (8_000_000, 2_000_000));
+    }
+
+    #[test]
+    fn hostmem_fragment_reports_consumed_and_cached_delta() {
+        // Available dropped 300 MiB (memory consumed); cached rose 50 MiB.
+        let frag = hostmem_fragment((8_000_000, 2_000_000), (7_700_000, 2_050_000));
+        let by_name = |n: &str| frag.series.iter().find(|s| s["name"] == n).unwrap()["data"]["value"].as_i64().unwrap();
+        assert_eq!(by_name("hostmem.mem_consumed_kib"), 300_000);
+        assert_eq!(by_name("hostmem.cached_delta_kib"), 50_000);
     }
 }
