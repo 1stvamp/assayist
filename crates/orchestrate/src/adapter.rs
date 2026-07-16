@@ -62,6 +62,14 @@ pub trait Target {
     fn pinning_layout(&self) -> Option<Value> {
         None
     }
+    /// Snapshot memory files whose page-cache residency should be measured after
+    /// the guest reaches steady. Each entry is `(instance_label, mem_file_path)`;
+    /// the orchestrator `mincore(2)`s each and emits `resident.snapshot_*` keyed
+    /// by the label. This is the per-guest attribution the host-memory delta
+    /// cannot give (the delta is system-wide). Adapter-specific, default none.
+    fn resident_files(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 pub trait Workload {
@@ -284,6 +292,20 @@ impl Target for FanoutTarget {
             Some(Value::Object(map))
         }
     }
+
+
+    fn resident_files(&self) -> Vec<(String, String)> {
+        // Key each instance's mem file by its index, so N sandboxes restored
+        // from one snapshot get per-guest residency (the file is shared through
+        // the page cache, so the numbers show what each faulted in).
+        let mut out = Vec::new();
+        for (i, t) in self.inners.iter().enumerate() {
+            for (_, path) in t.resident_files() {
+                out.push((format!("instance{i}"), path));
+            }
+        }
+        out
+    }
 }
 
 /// Parse `MemAvailable` and `Cached` (both KiB) out of /proc/meminfo text.
@@ -334,6 +356,89 @@ fn hostmem_fragment(before: (i64, i64), after: (i64, i64)) -> Fragment {
         self_metrics: vec![],
         capture_meta: Some(json!({"gadget": "hostmem", "source": "/proc/meminfo"})),
     }
+}
+
+
+/// Page-cache residency of `path`: (resident_pages, total_pages). mmaps the
+/// file MAP_SHARED and calls `mincore(2)`, so it reflects the file's page-cache
+/// residency, not this process's private faults. Best-effort: any failure
+/// (missing file, mmap/mincore error) returns `None` so a resident probe never
+/// fails the run. Mirrors the standalone `capture/resident` gadget.
+fn sample_residency(path: &str) -> Option<(u64, u64)> {
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len() as usize;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return None;
+    }
+    let page = page as usize;
+    if len == 0 {
+        return Some((0, 0));
+    }
+    let pages = len.div_ceil(page);
+    let addr = unsafe {
+        use std::os::fd::AsRawFd;
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0)
+    };
+    if addr == libc::MAP_FAILED {
+        return None;
+    }
+    let mut vec = vec![0u8; pages];
+    let rc = unsafe { libc::mincore(addr, len, vec.as_mut_ptr() as *mut _) };
+    unsafe { libc::munmap(addr, len) };
+    if rc != 0 {
+        return None;
+    }
+    // Residency is bit 0 of each returned byte.
+    let resident = vec.iter().filter(|b| *b & 1 == 1).count() as u64;
+    Some((resident, pages as u64))
+}
+
+/// A synthetic capture fragment carrying per-guest snapshot residency, measured
+/// orchestrator-side (like `hostmem_fragment`) rather than by an eBPF gadget.
+/// Each `(label, path)` is `mincore`d and emitted as `resident.snapshot_*` keyed
+/// by the label, so under fanout each instance gets its own numbers. A single
+/// instance keys as a singleton; N > 1 keys `bounded` by guest index. Files that
+/// could not be measured are skipped (best effort). Returns `None` when nothing
+/// was measurable, so a non-snapshot target adds no series.
+fn resident_fragment(samples: &[(String, u64, u64)]) -> Option<Fragment> {
+    if samples.is_empty() {
+        return None;
+    }
+    let multi = samples.len() > 1;
+    let card = |key_present: bool| {
+        if multi && key_present {
+            json!({"class": "bounded", "key_source": "guest_index", "max_keys": samples.len()})
+        } else {
+            json!({"class": "singleton"})
+        }
+    };
+    let mut series = Vec::with_capacity(samples.len() * 3);
+    for (label, resident, total) in samples {
+        let fraction = if *total > 0 { *resident as f64 / *total as f64 } else { 0.0 };
+        let key = (!label.is_empty()).then(|| label.clone());
+        let gauge = |name: &str, value: Value| {
+            let mut m = serde_json::Map::new();
+            m.insert("name".into(), json!(name));
+            m.insert("unit".into(), json!("1"));
+            m.insert("kind".into(), json!("gauge"));
+            m.insert("source".into(), json!("resident"));
+            if let Some(k) = &key {
+                m.insert("key".into(), json!(k));
+            }
+            m.insert("cardinality".into(), card(key.is_some()));
+            m.insert("data".into(), json!({"value": value, "time_unix_nano": 0}));
+            Value::Object(m)
+        };
+        series.push(gauge("resident.snapshot_resident_pages", json!(resident)));
+        series.push(gauge("resident.snapshot_total_pages", json!(total)));
+        series.push(gauge("resident.snapshot_fraction", json!(fraction)));
+    }
+    Some(Fragment {
+        series,
+        self_metrics: vec![],
+        capture_meta: Some(json!({"gadget": "resident", "source": "mincore"})),
+    })
 }
 
 /// Drive one run: bring the target up, spawn the gadgets, run the workload
@@ -388,9 +493,22 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
     let _ = workload.stop(sh);
     let workload_report = workload.report(sh).unwrap_or(Value::Null);
     let spans = target.spans(sh)?;
+
+    // Per-guest snapshot residency, sampled while the guest is still up (so the
+    // page cache is warm) and before teardown. Best-effort: unmeasurable files
+    // are dropped, so a non-snapshot target adds nothing here.
+    let resident: Vec<(String, u64, u64)> = target
+        .resident_files()
+        .into_iter()
+        .filter_map(|(label, path)| sample_residency(&path).map(|(r, t)| (label, r, t)))
+        .collect();
+
     target.teardown(sh)?;
 
     fragments.push(hostmem_fragment(mem_before, mem_after));
+    if let Some(f) = resident_fragment(&resident) {
+        fragments.push(f);
+    }
 
     Ok(RunArtifacts { fragments, spans, workload_report })
 }
@@ -592,5 +710,94 @@ mod tests {
 
         f.teardown(&sh).unwrap();
         assert_eq!(count("td"), 3);
+    }
+
+    /// A target that only reports resident files, for the fanout aggregation test.
+    struct ResidentStub(Vec<(String, String)>);
+    impl Target for ResidentStub {
+        fn version(&self, _: &dyn Shell) -> String {
+            "stub".into()
+        }
+        fn provision(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn start(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn reach_steady(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn spans(&self, _: &dyn Shell) -> Result<Vec<Value>, String> {
+            Ok(vec![])
+        }
+        fn teardown(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn resident_files(&self) -> Vec<(String, String)> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn resident_fragment_single_is_singleton_unkeyed() {
+        let frag = resident_fragment(&[(String::new(), 30, 100)]).unwrap();
+        assert_eq!(frag.series.len(), 3);
+        let frac = frag.series.iter().find(|s| s["name"] == "resident.snapshot_fraction").unwrap();
+        assert_eq!(frac["data"]["value"].as_f64().unwrap(), 0.30);
+        assert_eq!(frac["cardinality"]["class"], "singleton");
+        assert!(frac.get("key").is_none());
+    }
+
+    #[test]
+    fn resident_fragment_multi_keys_per_instance() {
+        let frag =
+            resident_fragment(&[("instance0".into(), 10, 100), ("instance1".into(), 90, 100)]).unwrap();
+        assert_eq!(frag.series.len(), 6);
+        let keyed: Vec<_> = frag
+            .series
+            .iter()
+            .filter(|s| s["name"] == "resident.snapshot_resident_pages")
+            .collect();
+        assert_eq!(keyed.len(), 2);
+        assert_eq!(keyed[0]["key"], "instance0");
+        assert_eq!(keyed[0]["cardinality"]["class"], "bounded");
+        assert_eq!(keyed[0]["cardinality"]["key_source"], "guest_index");
+    }
+
+    #[test]
+    fn resident_fragment_empty_is_none() {
+        assert!(resident_fragment(&[]).is_none());
+    }
+
+    #[test]
+    fn fanout_keys_resident_files_per_instance() {
+        let inners: Vec<Box<dyn Target>> = vec![
+            Box::new(ResidentStub(vec![(String::new(), "/snap/mem".into())])),
+            Box::new(ResidentStub(vec![(String::new(), "/snap/mem".into())])),
+        ];
+        let f = FanoutTarget::new(inners);
+        let files = f.resident_files();
+        assert_eq!(files, vec![
+            ("instance0".to_string(), "/snap/mem".to_string()),
+            ("instance1".to_string(), "/snap/mem".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn sample_residency_counts_pages_of_a_real_file() {
+        // A freshly written temp file: mincore should see a total page count that
+        // matches its size, and residency measurement should not error.
+        let path = std::env::temp_dir().join(format!("assayist-resident-test-{}", std::process::id()));
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        std::fs::write(&path, vec![7u8; (page * 3) as usize]).unwrap();
+        let (resident, total) = sample_residency(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(total, 3);
+        assert!(resident <= total);
+    }
+
+    #[test]
+    fn sample_residency_missing_file_is_none() {
+        assert!(sample_residency("/no/such/mem/file").is_none());
     }
 }

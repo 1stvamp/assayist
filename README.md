@@ -203,6 +203,8 @@ capture:
 
 On a cold restore of a 256 MiB snapshot, this read ~5% resident, the working set the guest touched to reach steady. For a file-backed restore it is the set shared through the page cache (so concurrent instances of one snapshot count it once); a userfaultfd restore copies pages into each guest's own anonymous memory, off the file, so this measures the shared/file residency, not per-guest private memory.
 
+The firecracker adapter also reports residency **per guest**, measured orchestrator-side (like the host-memory delta, not an eBPF gadget): after the guests reach steady, `assayist run` mincores each restore's mem file and emits `resident.snapshot_*` keyed per instance. This is the attribution the system-level `hostmem` delta cannot give: the delta is the machine cost, the per-guest resident is what each sandbox faulted in. Under `instances: N` each instance is keyed `instance0..N-1` (bounded cardinality); a lone restore keys as a singleton. No def wiring needed, it rides the restore. Validated: 6 file-backed sandboxes of one snapshot each reported the same ~5% file residency (they share the page cache), the expected file-backed signature seen per instance rather than only in aggregate.
+
 ### Concurrent sandboxes
 
 `instances: N` brings up N sandboxes from the same snapshot and holds them all resident through the capture window, so the host-memory delta is the aggregate. A file-backed restore stays roughly flat as N grows (the shared working set counts once); a per-sandbox copy grows with N. Make it the A/B axis to measure the scaling directly:

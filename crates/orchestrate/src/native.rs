@@ -417,6 +417,17 @@ impl Target for FirecrackerTarget {
     fn pinning_layout(&self) -> Option<Value> {
         self.pinning.borrow().clone()
     }
+
+
+    fn resident_files(&self) -> Vec<(String, String)> {
+        // Only a restore has a snapshot mem file to measure residency of; a cold
+        // boot has none. The label is empty for a lone instance (fanout keys it
+        // per instance).
+        match &self.from_snapshot {
+            Some((_, mem_file)) if !mem_file.is_empty() => vec![(String::new(), mem_file.clone())],
+            _ => Vec::new(),
+        }
+    }
 }
 
 // --- qemu target ------------------------------------------------------------
@@ -1134,6 +1145,25 @@ mod tests {
         let spans = t.spans(&sh).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0]["name"], "restore.resume_to_steady");
+    }
+
+    #[test]
+    fn firecracker_resident_files_only_for_restore() {
+        // A restore exposes its snapshot mem file for residency; a cold boot has
+        // none.
+        let restore = firecracker_target(
+            &config(&[("from_snapshot", json!("/s/snap")), ("mem_file", json!("/s/mem"))]),
+            &vars(&[]),
+            false,
+        );
+        assert_eq!(restore.resident_files(), vec![(String::new(), "/s/mem".to_string())]);
+
+        let cold = firecracker_target(
+            &config(&[("kernel", json!("/k")), ("rootfs", json!("/r"))]),
+            &vars(&[]),
+            false,
+        );
+        assert!(cold.resident_files().is_empty());
     }
 
     #[test]
