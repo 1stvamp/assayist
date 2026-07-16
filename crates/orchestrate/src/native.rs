@@ -123,7 +123,11 @@ pub fn firecracker_target(
     let mem_mib = vars.get("mem_mib").cloned().unwrap_or_else(|| g("mem_mib", "128"));
     let smt = matches!(g("smt", "false").as_str(), "true" | "on" | "1");
     let pid = std::process::id();
-    let sock = g("api_sock", &format!("/tmp/assayist-fc-{pid}.sock"));
+    // The default socket carries the per-instance index (empty for a lone
+    // instance) so concurrent instances of one def do not collide on it. A def
+    // that sets `api_sock` for N > 1 should template `{instance}` itself.
+    let inst = vars.get("instance").map(|i| format!("-{i}")).filter(|_| vars.contains_key("instance"));
+    let sock = g("api_sock", &format!("/tmp/assayist-fc-{pid}{}.sock", inst.unwrap_or_default()));
 
     let from_snapshot = match (config.get("from_snapshot"), config.get("mem_file")) {
         (Some(_), _) => Some((g("from_snapshot", ""), g("mem_file", ""))),
@@ -162,6 +166,20 @@ impl FirecrackerTarget {
             self.sock
         );
         sh.run(&cmd).map(|_| ())
+    }
+
+    /// Launch the firecracker API server in a fresh, wiped scratch cwd (see the
+    /// vsock note in `provision`), recording its pid for teardown.
+    fn launch_cmd(&self) -> String {
+        format!(
+            "rm -f '{sock}' '{sock}.pid'; wd='{sock}.d'; rm -rf \"$wd\"; mkdir -p \"$wd\"; \
+             ( cd \"$wd\" && exec '{bin}' --api-sock '{sock}' ) >'{sock}.log' 2>&1 & \
+             echo $! > '{sock}.pid'; \
+             for _ in $(seq 1 100); do [ -S '{sock}' ] && exit 0; sleep 0.05; done; \
+             echo 'firecracker api socket did not appear' >&2; exit 1",
+            sock = self.sock,
+            bin = self.bin,
+        )
     }
 
     /// Time a fallible API step and record it as a span.
@@ -209,26 +227,16 @@ impl Target for FirecrackerTarget {
     }
 
     fn provision(&self, sh: &dyn Shell) -> Result<(), String> {
-        // Launch the API server, record its pid, and wait for the socket to
-        // appear. The pid goes to a file so teardown can kill by pid rather than
-        // matching the command line: a `pkill -f -- "--api-sock <sock>"` also
-        // matches the very shell running it and SIGTERMs itself.
-        // Run firecracker in a fresh scratch cwd, recreated each launch. A
-        // restored snapshot can carry a vsock device whose host-side uds is a
-        // *relative* path (Firecracker resolves it against cwd); without an
-        // isolated, wiped cwd a leftover socket from the previous repeat makes
-        // the next `snapshot/load` fail with EADDRINUSE. Def paths are absolute,
-        // so cd does not affect kernel/rootfs/snapshot resolution.
-        let launch = format!(
-            "rm -f '{sock}' '{sock}.pid'; wd='{sock}.d'; rm -rf \"$wd\"; mkdir -p \"$wd\"; \
-             ( cd \"$wd\" && exec '{bin}' --api-sock '{sock}' ) >'{sock}.log' 2>&1 & \
-             echo $! > '{sock}.pid'; \
-             for _ in $(seq 1 100); do [ -S '{sock}' ] && exit 0; sleep 0.05; done; \
-             echo 'firecracker api socket did not appear' >&2; exit 1",
-            sock = self.sock,
-            bin = self.bin,
-        );
-        sh.run(&launch)?;
+        // Each firecracker runs in a fresh, wiped scratch cwd. A restored
+        // snapshot can carry a vsock device whose host-side uds is a *relative*
+        // path (Firecracker resolves it against cwd); without an isolated, wiped
+        // cwd a leftover socket from the previous repeat makes the next
+        // `snapshot/load` fail with EADDRINUSE, and N concurrent instances would
+        // collide on one path. Def paths are absolute, so cd does not affect
+        // kernel/rootfs/snapshot resolution. The pid goes to a file so teardown
+        // can kill by pid rather than matching the command line (which would also
+        // match the shell running the command and SIGTERM itself).
+        sh.run(&self.launch_cmd())?;
 
         if let Some((snap, mem)) = &self.from_snapshot {
             // Set the page-cache state the restore starts from (drop caches for a
@@ -323,9 +331,10 @@ impl Target for FirecrackerTarget {
 
     fn teardown(&self, sh: &dyn Shell) -> Result<(), String> {
         // Best effort: kill the API server by the pid recorded at launch, then
-        // remove the socket/pid/log. `rm -f` is last and always succeeds, so a
-        // stale or missing pid is not fatal. Killing by pid (not by command-line
-        // match) avoids SIGTERMing the shell that runs this very command.
+        // remove the socket/pid/log/scratch. `rm -rf` is last and always
+        // succeeds, so a stale or missing pid is not fatal. Killing by pid (not
+        // by command-line match) avoids SIGTERMing the shell that runs this very
+        // command.
         let cmd = format!(
             "[ -f '{sock}.pid' ] && kill \"$(cat '{sock}.pid')\" 2>/dev/null; \
              rm -rf '{sock}' '{sock}.log' '{sock}.pid' '{sock}.d'",
@@ -786,6 +795,23 @@ mod tests {
         let spans = t.spans(&sh).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0]["name"], "restore.resume_to_steady");
+    }
+
+    #[test]
+    fn firecracker_default_socket_carries_the_instance_index() {
+        let base = firecracker_target(&config(&[("from_snapshot", json!("/s"))]), &vars(&[]), false);
+        let sh = FakeShell::new();
+        base.provision(&sh).unwrap();
+        assert!(sh.seen.borrow().iter().any(|c| c.contains("assayist-fc-") && !c.contains(".sock-")));
+
+        let mut v = vars(&[]);
+        v.insert("instance".into(), "2".into());
+        let inst = firecracker_target(&config(&[("from_snapshot", json!("/s"))]), &v, false);
+        let sh2 = FakeShell::new();
+        inst.provision(&sh2).unwrap();
+        // The per-instance socket is discriminated so concurrent instances of
+        // one def do not collide.
+        assert!(sh2.seen.borrow().iter().any(|c| c.contains("-2.sock")));
     }
 
     #[test]

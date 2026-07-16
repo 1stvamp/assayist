@@ -10,7 +10,9 @@
 //! can be wired without writing Rust. Templates interpolate the cell's params as
 //! `{name}`. Shell access sits behind [`Shell`] so tests never exec anything.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use assayist_contract::Fragment;
 use serde_json::{json, Value};
@@ -186,6 +188,87 @@ pub struct RunArtifacts {
     pub fragments: Vec<Fragment>,
     pub spans: Vec<Value>,
     pub workload_report: Value,
+}
+
+fn now_nanos() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
+
+/// Runs N inner targets as one, for concurrency benchmarks: it brings every
+/// instance up and holds it resident through the capture window, so a host-side
+/// capture (the memory delta especially) measures the aggregate. A file-backed
+/// restore stays roughly flat as N grows; a per-sandbox copy grows with N.
+///
+/// This is where concurrency lives, generic over the inner `Target`, so any
+/// adapter (firecracker, the command adapter, a future hypervisor) gets
+/// N-sandbox runs without its own fanout code. Each inner is built with a
+/// distinct `{instance}` var so its sockets and scratch dirs do not collide. It
+/// records one aggregate lifecycle span (wall time to bring all instances to
+/// steady) under the inner adapter's own span name, so a 1-vs-N comparison lines
+/// the metric up, and drops the per-instance lifecycle spans that would
+/// otherwise collide on that id.
+pub struct FanoutTarget {
+    inners: Vec<Box<dyn Target>>,
+    start_ns: RefCell<u64>,
+    spans: RefCell<Vec<Value>>,
+}
+
+impl FanoutTarget {
+    pub fn new(inners: Vec<Box<dyn Target>>) -> FanoutTarget {
+        FanoutTarget { inners, start_ns: RefCell::new(0), spans: RefCell::new(Vec::new()) }
+    }
+}
+
+impl Target for FanoutTarget {
+    fn version(&self, sh: &dyn Shell) -> String {
+        self.inners.first().map(|t| t.version(sh)).unwrap_or_else(|| "fanout".to_string())
+    }
+    fn provision(&self, sh: &dyn Shell) -> Result<(), String> {
+        *self.start_ns.borrow_mut() = now_nanos();
+        for t in &self.inners {
+            t.provision(sh)?;
+        }
+        Ok(())
+    }
+    fn start(&self, sh: &dyn Shell) -> Result<(), String> {
+        for t in &self.inners {
+            t.start(sh)?;
+        }
+        Ok(())
+    }
+    fn reach_steady(&self, sh: &dyn Shell) -> Result<(), String> {
+        for t in &self.inners {
+            t.reach_steady(sh)?;
+        }
+        let end = now_nanos();
+        // Name the aggregate span after the inner adapter's own lifecycle span
+        // (restore.resume_to_steady, boot.api_to_init, ...), so a 1-vs-N compare
+        // reduces to the same metric id.
+        let name = self
+            .inners
+            .first()
+            .and_then(|t| t.spans(sh).ok())
+            .and_then(|s| s.last().and_then(|sp| sp.get("name").and_then(|n| n.as_str()).map(String::from)))
+            .unwrap_or_else(|| "reach_steady".to_string());
+        self.spans.borrow_mut().push(json!({
+            "name": name,
+            "start_unix_nano": *self.start_ns.borrow(),
+            "end_unix_nano": end,
+        }));
+        Ok(())
+    }
+    fn spans(&self, _sh: &dyn Shell) -> Result<Vec<Value>, String> {
+        Ok(self.spans.borrow().clone())
+    }
+    fn teardown(&self, sh: &dyn Shell) -> Result<(), String> {
+        let mut last = Ok(());
+        for t in &self.inners {
+            if let Err(e) = t.teardown(sh) {
+                last = Err(e);
+            }
+        }
+        last
+    }
 }
 
 /// Parse `MemAvailable` and `Cached` (both KiB) out of /proc/meminfo text.
@@ -459,5 +542,40 @@ mod tests {
         let by_name = |n: &str| frag.series.iter().find(|s| s["name"] == n).unwrap()["data"]["value"].as_i64().unwrap();
         assert_eq!(by_name("hostmem.mem_consumed_kib"), 300_000);
         assert_eq!(by_name("hostmem.cached_delta_kib"), 50_000);
+    }
+
+    #[test]
+    fn fanout_drives_every_inner_and_emits_one_aggregate_span() {
+        let sh = FakeShell::new()
+            .reply("emit", r#"[{"name":"boot.api_to_init","start_unix_nano":1,"end_unix_nano":2}]"#);
+        let inners: Vec<Box<dyn Target>> = (0..3)
+            .map(|_| {
+                Box::new(CommandTarget(cset(&[
+                    ("provision", "prov"),
+                    ("start", "st"),
+                    ("reach_steady", "ready"),
+                    ("spans", "emit"),
+                    ("teardown", "td"),
+                ]))) as Box<dyn Target>
+            })
+            .collect();
+        let f = FanoutTarget::new(inners);
+        f.provision(&sh).unwrap();
+        f.start(&sh).unwrap();
+        f.reach_steady(&sh).unwrap();
+
+        // Every instance was driven through the lifecycle.
+        let count = |needle: &str| sh.seen.borrow().iter().filter(|c| c.as_str() == needle).count();
+        assert_eq!(count("prov"), 3);
+        assert_eq!(count("ready"), 3);
+
+        // One aggregate span, named after the inner's own lifecycle span, not
+        // three colliding ones.
+        let spans = f.spans(&sh).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0]["name"], "boot.api_to_init");
+
+        f.teardown(&sh).unwrap();
+        assert_eq!(count("td"), 3);
     }
 }
