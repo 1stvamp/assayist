@@ -32,7 +32,7 @@ Why "assay": a benchmark run is an assay, a controlled measurement of one prepar
 | `crates/contract` (typed producer-side model, grading) | built, tested |
 | `crates/gate` (permutation A/B, drift, subsystem triad) | built, tested, six scenarios verified |
 | `capture/kvm` (exit-handling latency) | built and run: captured 100k+ real exits from a Firecracker microVM |
-| `capture/block` (block-IO latency per device) | built and run: per-device read/write latency + byte counters over a cold snapshot restore, driven through `assayist run` alongside the kvm gadget |
+| `capture/block` (block-IO latency per device) | built and run: per-device read/write latency + byte counters over a cold snapshot restore, driven through `assayist run` alongside the kvm gadget; `--hires` emits a log-linear (`layout: explicit`) histogram with a ~4x finer p99 so the gate can grade the tail |
 | `capture/resident` (snapshot residency: mincore on the mem file) | built and run: pure userspace (no BTF), reports resident/total pages + fraction, driven through `assayist run` |
 | `capture/net` (tap/virtio-net counters + size histograms) | built and run: attaches XDP/TC and emits; real packet signal needs a tap/NIC (the agentless vsock guests here have none) |
 | `capture/ctrlplane` (scheduler-treatment: run-queue latency, on-CPU) | built and run: captured run-queue latency from the sched tracepoints; flags `over_budget` when unscoped, scope with `--cgroup` |

@@ -32,6 +32,17 @@ struct {
 	__type(value, struct blk_stat);
 } stats SEC(".maps");
 
+// Zeroed scratch for initialising a new stats entry. blk_stat is larger than
+// the 512-byte BPF stack allows since the log-linear histogram, so we cannot
+// zero-init it on the stack; a single-element per-cpu array is kernel-zeroed
+// and never written, so it stays a clean zero source.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct blk_stat);
+} zero_stat SEC(".maps");
+
 static __always_inline __u64 log2_u64(__u64 v)
 {
 	__u64 shift, r;
@@ -89,8 +100,13 @@ int handle_complete(struct trace_event_raw_block_rq_completion *ctx)
 
 	st = bpf_map_lookup_elem(&stats, &bk);
 	if (!st) {
-		struct blk_stat zero = {};
-		bpf_map_update_elem(&stats, &bk, &zero, BPF_NOEXIST);
+		__u32 z = 0;
+		struct blk_stat *zero = bpf_map_lookup_elem(&zero_stat, &z);
+		if (!zero) {
+			bpf_map_delete_elem(&inflight, &k);
+			return 0;
+		}
+		bpf_map_update_elem(&stats, &bk, zero, BPF_NOEXIST);
 		st = bpf_map_lookup_elem(&stats, &bk);
 		if (!st) {
 			bpf_map_delete_elem(&inflight, &k);
@@ -98,7 +114,19 @@ int handle_complete(struct trace_event_raw_block_rq_completion *ctx)
 		}
 	}
 
-	slot = log2_u64(delta);
+	// Log-linear slot: octave = floor(log2(delta)), then a linear sub-bucket
+	// within [2^octave, 2^(octave+1)). Finer tail resolution than plain log2,
+	// same dynamic range. No overflow: octave is capped so base*SUBSLOTS stays
+	// well inside u64 for any ns-scale latency.
+	__u64 octave = log2_u64(delta);
+	if (octave >= MAX_OCTAVES)
+		octave = MAX_OCTAVES - 1;
+	__u64 base = 1ULL << octave;
+	__u64 rem = delta > base ? delta - base : 0;
+	__u64 sub = (rem * SUBSLOTS) / base;
+	if (sub >= SUBSLOTS)
+		sub = SUBSLOTS - 1;
+	slot = octave * SUBSLOTS + sub;
 	if (slot >= MAX_SLOTS)
 		slot = MAX_SLOTS - 1;
 

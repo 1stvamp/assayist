@@ -2,11 +2,13 @@
 
 Host-side block-IO service latency and throughput, per device, emitted as an AssayRun fragment.
 
-It matches `block_rq_issue` to `block_rq_complete` by dev+sector, measures the interval, and aggregates into in-kernel log2 histograms split read vs write. A byte counter per device rides alongside for throughput. This is biolatency's measurement wired to the Assayist contract, kept aggregation-in-kernel so nothing streams per request.
+It matches `block_rq_issue` to `block_rq_complete` by dev+sector, measures the interval, and aggregates into an in-kernel log-linear histogram split read vs write (each power-of-two octave holds 4 linear sub-buckets). A byte counter per device rides alongside for throughput. This is biolatency's measurement wired to the Assayist contract, kept aggregation-in-kernel so nothing streams per request.
+
+By default the sub-buckets are collapsed back to a 40-slot `log2` histogram, the same coarse layout every other gadget emits. `--hires` instead emits the full log-linear histogram as a `layout: explicit` series (160 buckets, `explicit_bounds`), whose p99 is ~4x finer, so the gate can grade the tail rather than treating the quantised log2 percentiles as advisory. See the gate README on why log2 percentiles are excluded.
 
 ## What it captures
 
-- `block.io_latency:read` / `block.io_latency:write`: log2 histograms (`unit: ns`), keyed by device (`maj:min`).
+- `block.io_latency:read` / `block.io_latency:write`: latency histograms (`unit: ns`), keyed by device (`maj:min`). `log2` layout by default, `layout: explicit` (log-linear, finer tail) under `--hires`.
 - `block.io_bytes:read` / `block.io_bytes:write`: monotonic byte counters (`unit: By`), keyed by device.
 - `self_metrics`: per-program cost via the BPF run-time counters, same as every gadget.
 
@@ -14,6 +16,8 @@ It matches `block_rq_issue` to `block_rq_complete` by dev+sector, measures the i
 
 ```
 sudo ./target/release/assayist-capture-block --duration 30 --out block-fragment.json
+# finer tail, gradeable p99:
+sudo ./target/release/assayist-capture-block --hires --duration 30 --out block-fragment.json
 ```
 
 Requirements and build are the same as `assayist-capture-kvm` (BTF kernel, clang + bpftool, generate `vmlinux.h` once). See that README for the shared setup.

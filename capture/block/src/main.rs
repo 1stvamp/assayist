@@ -18,7 +18,11 @@ mod block_skel {
 }
 use block_skel::*;
 
-const MAX_SLOTS: usize = 40;
+// Must match block.h. The in-kernel histogram is log-linear: MAX_OCTAVES
+// power-of-two octaves, each split into SUBSLOTS linear sub-buckets.
+const SUBSLOTS: usize = 4;
+const MAX_OCTAVES: usize = 40;
+const MAX_SLOTS: usize = MAX_OCTAVES * SUBSLOTS;
 
 #[derive(Parser, Debug)]
 #[command(name = "assayist-capture-block")]
@@ -30,8 +34,42 @@ struct Args {
     max_keys: u64,
     #[arg(long, default_value_t = 0.01)]
     budget: f64,
+    /// Emit the full log-linear histogram as an explicit-bounds series
+    /// (finer tail, so the gate can grade p99). Default collapses to the
+    /// coarse log2 layout, whose quantised percentiles the gate treats as
+    /// advisory.
+    #[arg(long)]
+    hires: bool,
     #[arg(long, default_value = "-")]
     out: String,
+}
+
+/// Collapse the log-linear sub-buckets back to `MAX_OCTAVES` log2 slots by
+/// summing each octave's `SUBSLOTS`. Produces the same octave counts a plain
+/// log2 gadget would, so the default output is unchanged.
+fn collapse_to_log2(slots: &[u32; MAX_SLOTS]) -> Vec<u32> {
+    let mut octaves = vec![0u32; MAX_OCTAVES];
+    for (i, &c) in slots.iter().enumerate() {
+        octaves[i / SUBSLOTS] += c;
+    }
+    octaves
+}
+
+/// Upper edges of the log-linear buckets, for the explicit layout. Bucket
+/// `s = octave * SUBSLOTS + sub` covers `[2^octave * (1 + sub/SUBSLOTS),
+/// 2^octave * (1 + (sub+1)/SUBSLOTS))`, so its upper edge is
+/// `2^octave * (1 + (sub+1)/SUBSLOTS)`. The contract's explicit layout wants
+/// `len(buckets) - 1` bounds (the last bucket is the open-ended overflow), so
+/// this returns `MAX_SLOTS - 1` edges.
+fn log_linear_bounds() -> Vec<f64> {
+    let mut bounds = Vec::with_capacity(MAX_SLOTS - 1);
+    for s in 0..MAX_SLOTS - 1 {
+        let octave = (s / SUBSLOTS) as u32;
+        let sub = (s % SUBSLOTS) as f64;
+        let base = (1u64 << octave) as f64;
+        bounds.push(base * (1.0 + (sub + 1.0) / SUBSLOTS as f64));
+    }
+    bounds
 }
 
 fn enable_run_time_stats() -> Result<OwnedFd> {
@@ -130,6 +168,16 @@ fn main() -> Result<()> {
         let rw = if is_write { "write" } else { "read" };
         let card = json!({ "class": "bounded", "key_source": "device", "max_keys": args.max_keys });
 
+        let hist_data = if args.hires {
+            json!({
+                "layout": "explicit",
+                "buckets": slots.to_vec(),
+                "explicit_bounds": log_linear_bounds(),
+                "count": count
+            })
+        } else {
+            json!({ "layout": "log2", "buckets": collapse_to_log2(&slots), "count": count })
+        };
         series.push(json!({
             "name": format!("block.io_latency:{rw}"),
             "unit": "ns",
@@ -137,7 +185,7 @@ fn main() -> Result<()> {
             "source": "block_rq_complete",
             "key": dev_str(dev),
             "cardinality": card,
-            "data": { "layout": "log2", "buckets": slots.to_vec(), "count": count }
+            "data": hist_data
         }));
         series.push(json!({
             "name": format!("block.io_bytes:{rw}"),
@@ -171,4 +219,46 @@ fn main() -> Result<()> {
         fs::write(&args.out, text).with_context(|| format!("writing {}", args.out))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapse_sums_each_octave() {
+        let mut slots = [0u32; MAX_SLOTS];
+        // octave 3, all four sub-buckets; octave 10, one sub-bucket.
+        slots[3 * SUBSLOTS] = 1;
+        slots[3 * SUBSLOTS + 1] = 2;
+        slots[3 * SUBSLOTS + 2] = 3;
+        slots[3 * SUBSLOTS + 3] = 4;
+        slots[10 * SUBSLOTS + 2] = 5;
+        let oct = collapse_to_log2(&slots);
+        assert_eq!(oct.len(), MAX_OCTAVES);
+        assert_eq!(oct[3], 10);
+        assert_eq!(oct[10], 5);
+        assert_eq!(oct.iter().sum::<u32>(), 15);
+    }
+
+    #[test]
+    fn bounds_len_is_one_less_than_buckets() {
+        // The contract's explicit layout wants len(buckets) - 1 bounds.
+        assert_eq!(log_linear_bounds().len(), MAX_SLOTS - 1);
+    }
+
+    #[test]
+    fn bounds_are_monotone_and_finer_than_octaves() {
+        let b = log_linear_bounds();
+        for w in b.windows(2) {
+            assert!(w[1] > w[0], "bounds must strictly increase: {w:?}");
+        }
+        // Octave 3 spans [8, 16); its four sub-bucket upper edges are 10,12,14,16.
+        let base = (1u64 << 3) as f64;
+        for sub in 0..SUBSLOTS {
+            let s = 3 * SUBSLOTS + sub;
+            let want = base * (1.0 + (sub as f64 + 1.0) / SUBSLOTS as f64);
+            assert!((b[s] - want).abs() < 1e-9, "bound {s} = {} want {want}", b[s]);
+        }
+    }
 }
