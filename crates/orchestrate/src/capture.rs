@@ -12,11 +12,13 @@
 //! spawn/wait split sits behind [`GadgetRunner`] so tests inject canned
 //! fragments without a BTF host.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use assayist_contract::Fragment;
 
+use crate::adapter::render;
 use crate::def::CaptureEntry;
 
 /// A resolved gadget launch: which binary, with which args, writing where.
@@ -30,12 +32,15 @@ pub struct GadgetInvocation {
 
 /// Turn the def's capture entries into concrete launches. For v0 every gadget
 /// gets `--duration` and `--out`; per-gadget cardinality flags (e.g. the kvm
-/// gadget's `--per-guest`/`--max-keys`) come from each entry's `args`, appended
-/// verbatim.
+/// gadget's `--per-guest`/`--max-keys`) come from each entry's `args`. Those
+/// args are rendered with `vars` (cell params, `{def_dir}`, ...) like the
+/// target/workload configs, so a gadget can reference e.g. a `{def_dir}`-relative
+/// mem file to measure.
 pub fn plan_gadgets(
     entries: &[CaptureEntry],
     duration_secs: u64,
     out_dir: &Path,
+    vars: &BTreeMap<String, String>,
 ) -> Result<Vec<GadgetInvocation>, String> {
     let mut plan = Vec::with_capacity(entries.len());
     for e in entries {
@@ -50,7 +55,7 @@ pub fn plan_gadgets(
             "--out".to_string(),
             out_path.to_string_lossy().into_owned(),
         ];
-        args.extend(e.args.iter().cloned());
+        args.extend(e.args.iter().map(|a| render(a, vars)));
         plan.push(GadgetInvocation { gadget, probe: e.probe.clone(), args, out_path });
     }
     Ok(plan)
@@ -176,7 +181,7 @@ mod tests {
     #[test]
     fn plans_duration_and_out_per_gadget() {
         let entries = vec![entry("kvm_exit", Some("assayist-capture-kvm"))];
-        let plan = plan_gadgets(&entries, 30, Path::new("/tmp/x")).unwrap();
+        let plan = plan_gadgets(&entries, 30, Path::new("/tmp/x"), &BTreeMap::new()).unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].gadget, "assayist-capture-kvm");
         assert!(plan[0].args.contains(&"--duration".to_string()));
@@ -188,7 +193,7 @@ mod tests {
     fn extra_args_are_appended_after_duration_and_out() {
         let mut e = entry("kvm_exit", Some("assayist-capture-kvm"));
         e.args = vec!["--per-guest".into(), "--max-keys".into(), "10000".into()];
-        let plan = plan_gadgets(&[e], 30, Path::new("/tmp/x")).unwrap();
+        let plan = plan_gadgets(&[e], 30, Path::new("/tmp/x"), &BTreeMap::new()).unwrap();
         assert_eq!(
             plan[0].args,
             vec!["--duration", "30", "--out", "/tmp/x/kvm_exit.frag.json", "--per-guest", "--max-keys", "10000"]
@@ -198,7 +203,7 @@ mod tests {
     #[test]
     fn planning_rejects_a_gadgetless_entry() {
         let entries = vec![entry("kvm_exit", None)];
-        assert!(plan_gadgets(&entries, 30, Path::new("/tmp")).is_err());
+        assert!(plan_gadgets(&entries, 30, Path::new("/tmp"), &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -222,7 +227,7 @@ mod tests {
             entry("kvm_exit", Some("g1")),
             entry("block_rq", Some("g2")),
         ];
-        let plan = plan_gadgets(&entries, 10, Path::new("/tmp")).unwrap();
+        let plan = plan_gadgets(&entries, 10, Path::new("/tmp"), &BTreeMap::new()).unwrap();
         let frags = capture(&plan, &runner).unwrap();
         assert_eq!(frags.len(), 2);
         assert_eq!(frags[0].series.len(), 1);
@@ -231,7 +236,7 @@ mod tests {
     #[test]
     fn capture_fails_if_a_gadget_has_no_fragment() {
         let runner = FakeRunner { by_probe: HashMap::new() };
-        let plan = plan_gadgets(&[entry("kvm_exit", Some("g1"))], 10, Path::new("/tmp")).unwrap();
+        let plan = plan_gadgets(&[entry("kvm_exit", Some("g1"))], 10, Path::new("/tmp"), &BTreeMap::new()).unwrap();
         assert!(capture(&plan, &runner).is_err());
     }
 
@@ -265,6 +270,7 @@ mod tests {
             &[entry("a", Some("g")), entry("b", Some("g")), entry("c", Some("g"))],
             10,
             Path::new("/tmp"),
+            &BTreeMap::new(),
         )
         .unwrap();
 

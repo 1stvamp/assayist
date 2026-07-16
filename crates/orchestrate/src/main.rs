@@ -452,7 +452,16 @@ fn capture_cmd(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let plan = match capture::plan_gadgets(&def.capture, ca.duration, &work_dir) {
+    let mut vars = adapter::vars(&params, &ca.sut_sha);
+    if let Some(dir) = std::path::Path::new(&ca.def_path)
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+    {
+        vars.insert("def_dir".to_string(), dir.to_string_lossy().into_owned());
+    }
+
+    let plan = match capture::plan_gadgets(&def.capture, ca.duration, &work_dir, &vars) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -476,14 +485,6 @@ fn capture_cmd(args: &[String]) -> ExitCode {
     // Real adapter/workload versions from the tools themselves (a `--version`
     // query, no provisioning), rather than the 0.0.0 placeholder.
     let shell = adapter::SystemShell;
-    let mut vars = adapter::vars(&params, &ca.sut_sha);
-    if let Some(dir) = std::path::Path::new(&ca.def_path)
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-    {
-        vars.insert("def_dir".to_string(), dir.to_string_lossy().into_owned());
-    }
     let target = select_target(&def, vars.clone(), prep.pin_threads);
     let workload = select_workload(&def, vars);
     let versions = run::AdapterVersions {
@@ -667,14 +668,14 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     vars.insert("def_dir".to_string(), def_dir.clone());
                 }
                 let target = build_target(&def, vars.clone(), prep.pin_threads);
-                let workload = select_workload(&def, vars);
+                let workload = select_workload(&def, vars.clone());
 
                 let work_dir = ra.out_dir.join("frags").join(format!("{group}-{ci}-{i}"));
                 if let Err(e) = std::fs::create_dir_all(&work_dir) {
                     eprintln!("creating work dir {}: {e}", work_dir.display());
                     return ExitCode::from(1);
                 }
-                let plan = match capture::plan_gadgets(&def.capture, ra.duration, &work_dir) {
+                let plan = match capture::plan_gadgets(&def.capture, ra.duration, &work_dir, &vars) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("{e}");
