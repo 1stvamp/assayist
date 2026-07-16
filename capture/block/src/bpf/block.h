@@ -3,7 +3,15 @@
 #ifndef __ASSAYIST_BLOCK_H
 #define __ASSAYIST_BLOCK_H
 
-#define MAX_SLOTS 40
+/* Latency histogram resolution. The gadget aggregates log-linear: each
+ * power-of-two octave is split into SUBSLOTS linear sub-buckets, so the tail
+ * (p99) has finer resolution than a plain 40-slot log2 histogram while keeping
+ * the same wide dynamic range. Userspace collapses the sub-buckets back to
+ * MAX_OCTAVES log2 slots for the default output, or emits all MAX_SLOTS as an
+ * explicit histogram under --hires (see block/src/main.rs). */
+#define SUBSLOTS 4
+#define MAX_OCTAVES 40
+#define MAX_SLOTS (MAX_OCTAVES * SUBSLOTS)
 
 /* In-flight request key. dev+sector identifies a request across the
  * issue->complete pair without needing a stable request pointer (which the
