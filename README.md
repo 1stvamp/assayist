@@ -242,7 +242,7 @@ Combined with `instances`, this measures dedup directly: on one host, four file-
 
 ### Full VMs (QEMU)
 
-`target.adapter: qemu` cold-boots a QEMU/KVM full VM (`-kernel`/`-drive`, a QMP control socket), timing the VM up to that socket appearing as `boot.vmm_ready`. Like the firecracker adapter's `boot.api_to_init`, that is a host-observable marker, not guest userspace init, which the agentless vantage cannot see; an optional `readiness` command bridges to a guest-ready signal. It is v0: cold boot only (QEMU savevm/migration restore and vCPU pinning are not wired yet).
+`target.adapter: qemu` cold-boots a QEMU/KVM full VM (`-kernel`/`-drive`, a QMP control socket), timing the VM up to that socket appearing as `boot.vmm_ready`, the same span name the firecracker adapter records for InstanceStart. That is a host-observable marker, not guest userspace init, which the agentless vantage cannot see; an optional `readiness` command bridges to a guest-ready signal. It is v0: cold boot only (QEMU savevm/migration restore and vCPU pinning are not wired yet).
 
 ```yaml
 target:

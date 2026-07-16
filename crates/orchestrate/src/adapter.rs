@@ -242,7 +242,7 @@ impl Target for FanoutTarget {
         }
         let end = now_nanos();
         // Name the aggregate span after the inner adapter's own lifecycle span
-        // (restore.resume_to_steady, boot.api_to_init, ...), so a 1-vs-N compare
+        // (restore.resume_to_steady, boot.vmm_ready, ...), so a 1-vs-N compare
         // reduces to the same metric id.
         let name = self
             .inners
@@ -484,11 +484,11 @@ mod tests {
     #[test]
     fn spans_parse_from_command_output() {
         let sh = FakeShell::new()
-            .reply("emit-spans", r#"[{"name":"boot.api_to_init","start_unix_nano":1,"end_unix_nano":9}]"#);
+            .reply("emit-spans", r#"[{"name":"boot.vmm_ready","start_unix_nano":1,"end_unix_nano":9}]"#);
         let t = CommandTarget(cset(&[("spans", "emit-spans")]));
         let spans = t.spans(&sh).unwrap();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0]["name"], "boot.api_to_init");
+        assert_eq!(spans[0]["name"], "boot.vmm_ready");
     }
 
     #[test]
@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn fanout_drives_every_inner_and_emits_one_aggregate_span() {
         let sh = FakeShell::new()
-            .reply("emit", r#"[{"name":"boot.api_to_init","start_unix_nano":1,"end_unix_nano":2}]"#);
+            .reply("emit", r#"[{"name":"boot.vmm_ready","start_unix_nano":1,"end_unix_nano":2}]"#);
         let inners: Vec<Box<dyn Target>> = (0..3)
             .map(|_| {
                 Box::new(CommandTarget(cset(&[
@@ -588,7 +588,7 @@ mod tests {
         // three colliding ones.
         let spans = f.spans(&sh).unwrap();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0]["name"], "boot.api_to_init");
+        assert_eq!(spans[0]["name"], "boot.vmm_ready");
 
         f.teardown(&sh).unwrap();
         assert_eq!(count("td"), 3);

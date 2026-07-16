@@ -14,12 +14,17 @@
 //! curl calls are the same requests a socket client would send, and every other
 //! adapter in the crate already goes through `Shell`.
 //!
-//! Limits: the `boot.api_to_init` span measures the
-//! InstanceStart API round-trip, not the guest reaching userspace init: without
-//! an in-guest agent the host cannot observe guest-init, and adding one would
-//! break the agentless vantage. `reach_steady` runs an optional author-supplied
-//! `readiness` shell probe. Teardown kills firecracker by matching the api-sock
-//! path, so do not share one sock path across concurrent runs.
+//! Limits: the `boot.vmm_ready` span measures the InstanceStart API round-trip
+//! (including the curl control-path hop), not the guest reaching userspace init:
+//! without an in-guest agent the host cannot observe guest-init, and adding one
+//! would break the agentless vantage. It shares its name with the qemu/CH
+//! adapters' equivalent marker, so a cross-VMM boot compare lines up. Measured
+//! run-to-run CoV is high (tens of percent, control-path jitter), so the noise
+//! gate usually treats it as advisory rather than gating on it; that is the
+//! intended behaviour (see issue #14). `reach_steady` runs an optional
+//! author-supplied `readiness` shell probe. Teardown kills firecracker by
+//! matching the api-sock path, so do not share one sock path across concurrent
+//! runs.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -81,7 +86,7 @@ fn version_token(out: &str) -> String {
 
 /// A firecracker microVM. Two modes, chosen by config:
 /// - cold boot (default): configure machine/boot-source/drives, then
-///   `InstanceStart`, recording `boot.api_to_init`.
+///   `InstanceStart`, recording `boot.vmm_ready`.
 /// - restore (`from_snapshot` set): `snapshot/load` with `resume_vm`, recording
 ///   `restore.resume_to_steady`; `start` is then a no-op.
 ///
@@ -348,7 +353,7 @@ impl Target for FirecrackerTarget {
         if self.from_snapshot.is_some() {
             return Ok(());
         }
-        self.timed("boot.api_to_init", None, || {
+        self.timed("boot.vmm_ready", None, || {
             self.api(sh, "PUT", "/actions", r#"{"action_type":"InstanceStart"}"#)
         })
     }
@@ -419,7 +424,7 @@ impl Target for FirecrackerTarget {
 /// A QEMU/KVM full-VM target (cold boot). It launches `qemu-system` with a QMP
 /// control socket and times the VM up to that socket appearing
 /// (`boot.vmm_ready`): the VMM is initialised and about to run the guest. Like
-/// the firecracker adapter's `boot.api_to_init`, this is a host-observable
+/// the firecracker adapter's `boot.vmm_ready`, this is a host-observable
 /// marker, not guest userspace init, which an agentless vantage cannot see; an
 /// optional `readiness` command bridges to a guest-ready signal when the def has
 /// one. Concurrency, host-memory, and residency capture all work through the
@@ -1105,7 +1110,7 @@ mod tests {
 
         let spans = t.spans(&sh).unwrap();
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0]["name"], "boot.api_to_init");
+        assert_eq!(spans[0]["name"], "boot.vmm_ready");
         assert!(spans[0]["end_unix_nano"].as_u64() >= spans[0]["start_unix_nano"].as_u64());
     }
 
@@ -1323,7 +1328,7 @@ mod tests {
 
         let names: Vec<String> =
             t.spans(&sh).unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
-        assert!(names.contains(&"boot.api_to_init".to_string()));
+        assert!(names.contains(&"boot.vmm_ready".to_string()));
         assert!(names.contains(&"snapshot.create".to_string()));
     }
 

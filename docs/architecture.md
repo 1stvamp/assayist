@@ -56,7 +56,7 @@ This is the most important artifact to get right, because it is the thing every 
 A run emits:
 
 - **Run identity**: target adapter id, workload id, config parameterisation (and a hash of it), git SHA of the system under test, and a full host fingerprint (kernel version, CPU model, SMT on/off, CPU governor, THP setting, mitigations, pinning layout, NUMA topology). Reproducibility lives or dies on the host fingerprint, so it is mandatory, not optional. A result with an incomplete fingerprint is rejected, not stored.
-- **Lifecycle spans**: named, timestamped intervals (e.g. `boot.api_to_init`, `snapshot.serialise`, `restore.resume_to_steady`, `schedule.pod_to_node`). Spans are the unit the gate compares for latency work.
+- **Lifecycle spans**: named, timestamped intervals (e.g. `boot.vmm_ready`, `snapshot.serialise`, `restore.resume_to_steady`, `schedule.pod_to_node`). Spans are the unit the gate compares for latency work.
 - **Continuous metrics**: name, unit, and aggregation kind (histogram / counter / gauge), plus which capture program produced it. Histograms are the default and the preferred kind: we aggregate in-kernel and ship summaries, we do not stream per-event (see capture plane).
 - **Observer-effect self-metrics**: every eBPF program reports its own cost via the kernel's BPF run-time counters (run_time_ns / run_cnt). These are first-class gated metrics, not diagnostics. If a probe's steady-state cost crosses the budget, the harness flags the *result* as contaminated, not just the probe. This is how we make "low observer effect" a measured property rather than a claim.
 
