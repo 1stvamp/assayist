@@ -121,6 +121,26 @@ pub struct FirecrackerTarget {
     /// (the socket Firecracker connects to) and `{mem_file}`, e.g.
     /// `bpfolio-reap --uds {uffd_uds} --mem {mem_file} ondemand`.
     uffd_handler: Option<String>,
+    /// Streaming restore (M-stream): when set, the mem file is served from a
+    /// per-instance FUSE mount backed by this source URL (`file://…` or
+    /// `http(s)://…`), and the File restore loads against the mounted file rather
+    /// than a local one. The mount is brought up before `snapshot/load` and
+    /// unmounted at teardown. Pages are shared across concurrent instances the
+    /// same way a local File restore shares them (one mount per instance).
+    stream_source: Option<String>,
+    /// The bpfoliod binary that provides `stream-mount`/`stream-prefetch`.
+    stream_bin: String,
+    /// Working-set metadata for streaming prewarm (`stream-prefetch`).
+    stream_wsmeta: String,
+    /// Whether to prewarm the working set from the source into the mount (inside
+    /// the pre-restore window) before loading. False = pure demand-fault over the
+    /// mount, the streaming baseline.
+    stream_prefetch: bool,
+    /// The FUSE mountpoint for this instance's stream restore, unique per target
+    /// (a per-construction nonce): rapidly remounting the *same* path within one
+    /// process can leave the kernel FUSE connection half-alive so the next mount
+    /// never appears, so each repeat gets a fresh path.
+    stream_dir: String,
     /// Pin each vCPU thread to a dedicated logical CPU and record the layout.
     pin_threads: bool,
     /// First logical CPU this instance's vCPUs pin to: `fc_vcpu n` -> CPU
@@ -162,6 +182,14 @@ pub fn firecracker_target(
         _ => "File".to_string(),
     };
     let uffd_handler = config.get("uffd_handler").map(|_| g("uffd_handler", ""));
+    let stream_source = config
+        .get("stream_source")
+        .map(|_| g("stream_source", ""))
+        .filter(|s| !s.trim().is_empty());
+    // Treat "stream"/"true"/"on" as prewarm; anything else (e.g. "nostream") is
+    // pure demand-fault. Lets a def drive the A/B with a single {mode} value.
+    let stream_prefetch = matches!(g("stream_prefetch", "false").to_lowercase().as_str(), "stream" | "true" | "on");
+    let stream_dir = format!("{}.stream.{}", sock, now_nanos());
 
     FirecrackerTarget {
         bin: g("bin", "firecracker"),
@@ -178,6 +206,11 @@ pub fn firecracker_target(
         pre_restore,
         mem_backend,
         uffd_handler,
+        stream_source,
+        stream_bin: g("stream_bin", "bpfoliod"),
+        stream_wsmeta: g("stream_wsmeta", ""),
+        stream_prefetch,
+        stream_dir,
         pin_threads,
         cpu_base: vars.get("cpu_base").and_then(|s| s.parse().ok()).unwrap_or(0),
         spans: RefCell::new(Vec::new()),
@@ -229,6 +262,42 @@ impl FirecrackerTarget {
              echo $! > '{uds}.pid'; \
              for _ in $(seq 1 200); do [ -S '{uds}' ] && exit 0; sleep 0.05; done; \
              echo 'uffd handler socket did not appear' >&2; exit 1"
+        )
+    }
+
+    /// Launch `bpfoliod stream-mount` in the background: a FUSE mount at
+    /// `stream_dir` exposing `mem`, backed by `source`, sized from the real mem
+    /// file. Waits for the mounted file to appear so it is ready before
+    /// `snapshot/load`; records the pid for teardown.
+    fn launch_stream_cmd(&self, source: &str, mem: &str) -> String {
+        let dir = &self.stream_dir;
+        // Repeats reuse this per-instance path, so first fully retire any prior
+        // mount: kill the old daemon and wait for it to exit, then lazy-unmount
+        // and wipe the dir. A lingering daemon or half-torn-down FUSE mount makes
+        // the fresh stream-mount fail to appear.
+        format!(
+            "d='{dir}'; \
+             if [ -f \"$d.pid\" ]; then op=\"$(cat \"$d.pid\")\"; kill \"$op\" 2>/dev/null; \
+               for _ in $(seq 1 150); do kill -0 \"$op\" 2>/dev/null || break; sleep 0.02; done; fi; \
+             fusermount3 -uz \"$d\" 2>/dev/null; rm -rf \"$d\" '{dir}.pid' '{dir}.log'; mkdir -p \"$d\"; \
+             sz=$(stat -c%s '{mem}'); \
+             ( exec '{bin}' stream-mount '{source}' \"$d\" --size-bytes \"$sz\" --name mem ) >'{dir}.log' 2>&1 & \
+             mp=$!; echo \"$mp\" > '{dir}.pid'; \
+             for _ in $(seq 1 500); do [ -e \"$d/mem\" ] && exit 0; sleep 0.02; done; \
+             kill \"$mp\" 2>/dev/null; fusermount3 -uz \"$d\" 2>/dev/null; \
+             echo 'stream mount did not appear (see {dir}.log)' >&2; exit 1",
+            bin = self.stream_bin,
+        )
+    }
+
+    /// Prewarm the working set from `source` into the mounted file with
+    /// `stream-prefetch`, before the timed load. Run only when `stream_prefetch`.
+    fn stream_prefetch_cmd(&self, source: &str) -> String {
+        format!(
+            "'{bin}' stream-prefetch '{source}' --mem '{dir}/mem' --wsmeta '{ws}'",
+            bin = self.stream_bin,
+            dir = self.stream_dir,
+            ws = self.stream_wsmeta,
         )
     }
 
@@ -291,6 +360,15 @@ impl Target for FirecrackerTarget {
         sh.run(&self.launch_cmd())?;
 
         if let Some((snap, mem)) = &self.from_snapshot {
+            // Streaming (M-stream): bring the FUSE mount up first, so the load and
+            // any prewarm run against the mounted mem file rather than the local
+            // one. The mount must be listening before snapshot/load reads it.
+            let mem_path = if let Some(source) = &self.stream_source {
+                sh.run(&self.launch_stream_cmd(source, mem))?;
+                format!("{}/mem", self.stream_dir)
+            } else {
+                mem.clone()
+            };
             // Set the page-cache state the restore starts from (drop caches for a
             // cold baseline, or warm a captured working set). Run before the
             // timed load so the prewarm cost is not charged to restore latency.
@@ -299,9 +377,17 @@ impl Target for FirecrackerTarget {
                     sh.run(cmd)?;
                 }
             }
+            // Streaming prewarm: pull the working set from the source into the
+            // mount before loading (else the load pure-demand-faults over it).
+            if let Some(source) = &self.stream_source {
+                if self.stream_prefetch {
+                    sh.run(&self.stream_prefetch_cmd(source))?;
+                }
+            }
             // Pick the memory backend. Uffd serves guest RAM from an external
             // handler (launched here, listening before load); File mmaps the mem
-            // file. The handler must be up before snapshot/load connects to it.
+            // file (the mounted one under streaming). The handler must be up
+            // before snapshot/load connects to it.
             let backend = if self.mem_backend == "Uffd" {
                 let handler = self
                     .uffd_handler
@@ -312,7 +398,7 @@ impl Target for FirecrackerTarget {
                 sh.run(&self.launch_uffd_cmd(handler, &uds, mem))?;
                 json!({"backend_type": "Uffd", "backend_path": uds})
             } else {
-                json!({"backend_type": "File", "backend_path": mem})
+                json!({"backend_type": "File", "backend_path": mem_path})
             };
             // Restore mode: load resumes the VM; that is the measured span.
             let body = json!({
@@ -402,14 +488,28 @@ impl Target for FirecrackerTarget {
         // succeeds, so a stale or missing pid is not fatal. Killing by pid (not
         // by command-line match) avoids SIGTERMing the shell that runs this very
         // command.
-        // Also stop the uffd handler if one was launched (harmless no-op in File
-        // mode: the pidfile does not exist and `rm -rf` always succeeds).
+        // Also stop the uffd handler and unmount the stream FUSE mount if either
+        // was set up (harmless no-ops otherwise: the pidfiles/mount do not exist
+        // and `rm -rf` always succeeds). The mount is unmounted before its dir is
+        // removed, and its daemon killed.
+        // For a stream mount, firecracker mmaps the FUSE-backed mem, so unmount
+        // has to wait for it to exit or fusermount3 reports the mount busy and
+        // the dir cannot be removed. Kill it, wait for it to release, then lazy-
+        // unmount (-uz detaches even if a straggler holds it). A trailing `true`
+        // keeps teardown best-effort: leftover cleanup must not fail the run.
         let cmd = format!(
             "[ -f '{sock}.pid' ] && kill \"$(cat '{sock}.pid')\" 2>/dev/null; \
              [ -f '{uds}.pid' ] && kill \"$(cat '{uds}.pid')\" 2>/dev/null; \
-             rm -rf '{sock}' '{sock}.log' '{sock}.pid' '{sock}.d' '{uds}' '{uds}.log' '{uds}.pid'",
+             if [ -f '{sock}.pid' ]; then p=\"$(cat '{sock}.pid')\"; \
+               for _ in $(seq 1 150); do kill -0 \"$p\" 2>/dev/null || break; sleep 0.02; done; fi; \
+             fusermount3 -uz '{stream}' 2>/dev/null; \
+             [ -f '{stream}.pid' ] && kill \"$(cat '{stream}.pid')\" 2>/dev/null; \
+             rm -rf '{sock}' '{sock}.log' '{sock}.pid' '{sock}.d' '{uds}' '{uds}.log' '{uds}.pid' \
+             '{stream}' '{stream}.log' '{stream}.pid'; \
+             true",
             sock = self.sock,
             uds = self.uffd_uds(),
+            stream = self.stream_dir,
         );
         sh.run(&cmd).map(|_| ())
     }
@@ -1359,6 +1459,45 @@ mod tests {
         let t = firecracker_target(&cfg, &vars(&[]), false);
         let sh = FakeShell::new();
         assert!(t.provision(&sh).unwrap_err().contains("uffd_handler"));
+    }
+
+    #[test]
+    fn firecracker_streaming_mounts_then_loads_against_the_mount() {
+        // Prewarm arm: mount the FUSE source, stream-prefetch, then load File
+        // against the mounted mem (not the local one).
+        let cfg = config(&[
+            ("from_snapshot", json!("/s/snap")),
+            ("mem_file", json!("/s/mem")),
+            ("stream_source", json!("file:///s/mem")),
+            ("stream_bin", json!("/b/bpfoliod")),
+            ("stream_wsmeta", json!("/s/reap.wsmeta")),
+            ("stream_prefetch", json!("stream")),
+        ]);
+        let t = firecracker_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+
+        assert!(sh.saw("stream-mount"), "should launch the FUSE mount");
+        assert!(sh.saw("stream-prefetch"), "prewarm arm should stream-prefetch");
+        // The load's mem backend path is the mounted file, not the local mem.
+        let load = sh.first_containing("/snapshot/load").expect("loaded");
+        assert!(load.contains(".stream.") && load.contains("/mem"), "load should target the mounted mem: {load}");
+    }
+
+    #[test]
+    fn firecracker_streaming_demand_arm_skips_prefetch() {
+        let cfg = config(&[
+            ("from_snapshot", json!("/s/snap")),
+            ("mem_file", json!("/s/mem")),
+            ("stream_source", json!("file:///s/mem")),
+            ("stream_bin", json!("/b/bpfoliod")),
+            ("stream_prefetch", json!("nostream")),
+        ]);
+        let t = firecracker_target(&cfg, &vars(&[]), false);
+        let sh = FakeShell::new();
+        t.provision(&sh).unwrap();
+        assert!(sh.saw("stream-mount"), "demand arm still mounts");
+        assert!(!sh.saw("stream-prefetch"), "demand arm must not prewarm");
     }
 
     #[test]
