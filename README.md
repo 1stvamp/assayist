@@ -257,6 +257,27 @@ target:
 
 Combined with `instances`, this measures dedup directly: on one host, four file-backed sandboxes consumed ~1 MB of `hostmem.mem_consumed_kib` while four userfaultfd sandboxes of the same snapshot consumed ~21 MB. The handler is torn down with the run.
 
+### Streaming restore (mem served from a FUSE mount)
+
+`stream_source` restores the guest memory from a per-instance FUSE mount backed by a source URL (`file://…` or `http(s)://…`) instead of a local mem file: the adapter brings up `bpfoliod stream-mount` before `snapshot/load` (sized from the real mem file), loads File-backed against the mounted file, and unmounts at teardown. `stream_prefetch` chooses the arm: unset/`nostream` demand-faults every page over the mount; `stream`/`true` first warms the captured working set from the source (`stream-prefetch`) inside the pre-restore window. Each restore gets a unique mountpoint, so repeats do not collide on a half-torn-down FUSE mount.
+
+```yaml
+compare: mode
+parameterise:
+  mode: [nostream, stream]
+target:
+  adapter: firecracker
+  config:
+    from_snapshot: "{def_dir}/../run/fn/snapshot"
+    mem_file: "{def_dir}/../run/fn/mem"
+    stream_source: "file://{def_dir}/../run/fn/mem"   # or http(s):// for a real network test
+    stream_bin: "/path/to/bpfoliod"
+    stream_wsmeta: "{def_dir}/../run/fn/reap.wsmeta"
+    stream_prefetch: "{mode}"
+```
+
+Validated with a `file://` source (fuse3 required): demand vs prewarm restores of a 256 MiB snapshot assembled and gated, mount and unmount clean across repeats.
+
 ### Full VMs (QEMU)
 
 `target.adapter: qemu` cold-boots a QEMU/KVM full VM (`-kernel`/`-drive`, a QMP control socket), timing the VM up to that socket appearing as `boot.vmm_ready`, the same span name the firecracker adapter records for InstanceStart. That is a host-observable marker, not guest userspace init, which the agentless vantage cannot see; an optional `readiness` command bridges to a guest-ready signal. It is v0: cold boot only (QEMU savevm/migration restore and vCPU pinning are not wired yet).
