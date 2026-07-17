@@ -113,6 +113,21 @@ bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/bpf/vmlinux.h
 cargo build --release
 ```
 
+`bpftool` is only for regenerating `vmlinux.h` (each gadget commits one, so a normal build needs just clang). The gadgets are CO-RE: they embed the compiled BPF object and relocate against the running kernel's BTF at load, so a binary built once runs on any same-arch BTF host.
+
+### Prebuilt releases (for consumers)
+
+A downstream project does not need this source checkout. A tagged release ships one tarball, `assayist-x86_64-linux.tar.gz`, with the orchestrator, the gate, and every capture gadget. Because the gadgets are CO-RE, that set runs on any same-arch BTF host with no rebuild. Pull the lot with one mise entry:
+
+```toml
+[tools]
+"github:1stvamp/assayist" = "0.1.1"
+```
+
+`mise install` then puts `assayist`, `assayist-gate`, and all five capture gadgets on `PATH` together (mise verifies the release's artifact attestations too), and the pinned version flows into each run's identity. The orchestrator shells out to `assayist-gate` for the A/B permutation, so both must be present. The per-host build above is only for developing the gadgets or running on an arch a release does not cover.
+
+Cut a release with `mise run release -- vX.Y.Z` (`scripts/release.sh`): it builds the orchestrator, the gate, and the gadgets, packages the tarball (`bin/` at the archive root), and creates the GitHub release. Releases are cut from a BTF+KVM host, not CI, because the gadgets compile against the host's BTF and stock GitHub runners have no KVM tracepoint structs (`trace_event_raw_kvm_exit`) in their kernel BTF. The binaries are CO-RE, so one cut on any same-arch KVM host runs everywhere.
+
 **Licence split**: userspace is Apache-2.0; the eBPF objects (`capture/*/src/bpf/*.bpf.c`) are GPL-2.0 because kernel tracing helpers require it. Per-file SPDX headers are authoritative. See `LICENSE-APACHE` and `LICENSE-GPL`.
 
 ## Quickstart: the gate
