@@ -12,3 +12,6 @@ capture/*/src/bpf/vmlinux.h
 /.remember/
 # project agent instructions, kept local
 /CLAUDE.local.md
+
+# release build output
+/dist/
