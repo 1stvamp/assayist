@@ -1,11 +1,16 @@
 [package]
 name = "assayist-otlp"
-version = "0.0.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "OTLP export/import for the Assayist contract"
+readme = "README.md"
+keywords = ["benchmark", "otlp", "opentelemetry", "ebpf"]
+categories = ["development-tools::profiling"]
 
 [dependencies]
-assayist-contract = { path = "../contract" }
+assayist-contract.workspace = true
 serde_json = "1"
 sha2 = "0.10"

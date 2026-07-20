@@ -24,5 +24,22 @@ exclude = [
     "capture/resident",
 ]
 
+# Shared package metadata, inherited by each crate with `<field>.workspace = true`
+# so the core publishes to crates.io in lockstep. Bump `version` here to move the
+# whole core; the release tag (scripts/release.sh) and the crates share it.
+[workspace.package]
+version = "0.1.3"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/1stvamp/assayist"
+rust-version = "1.97"
+
+# Internal crates carry a version alongside the path so `cargo publish` (which
+# strips the path) has a version requirement to record. Keep these at the
+# workspace version.
+[workspace.dependencies]
+assayist-contract = { path = "crates/contract", version = "0.1.3" }
+assayist-otlp = { path = "crates/otlp", version = "0.1.3" }
+
 [profile.release]
 opt-level = 2
