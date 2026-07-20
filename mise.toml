@@ -32,6 +32,16 @@ run = "bash scripts/verify-gate.sh"
 description = "Clippy with warnings denied (matches CI)"
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
+[tasks.lint-gadgets]
+description = "Clippy the capture gadgets (excluded from the workspace, so `lint` skips them). Needs a BTF host + clang for the eBPF ones; resident is pure userspace."
+run = """
+set -e
+for g in kvm block net ctrlplane resident; do
+  echo "clippy: capture/$g"
+  cargo clippy --manifest-path "capture/$g/Cargo.toml" --all-targets -- -D warnings
+done
+"""
+
 [tasks.fmt]
 description = "Format the workspace with rustfmt"
 run = "cargo fmt --all"

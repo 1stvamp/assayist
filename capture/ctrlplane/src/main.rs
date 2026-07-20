@@ -133,10 +133,10 @@ fn parse_named(items: &[String]) -> Result<Vec<(String, String)>> {
 fn parse_hist(bytes: &[u8]) -> ([u32; MAX_SLOTS], u64) {
     let mut slots = [0u32; MAX_SLOTS];
     let mut count = 0u64;
-    for i in 0..MAX_SLOTS {
+    for (i, slot) in slots.iter_mut().enumerate() {
         let off = i * 4;
         let v = u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
-        slots[i] = v;
+        *slot = v;
         count += v as u64;
     }
     (slots, count)
@@ -162,9 +162,9 @@ fn main() -> Result<()> {
 
     let _stats_fd = enable_run_time_stats().context("enabling BPF run-time stats")?;
 
-    let mut skel_builder = CtrlplaneSkelBuilder::default();
+    let skel_builder = CtrlplaneSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
-    let mut open_skel = skel_builder.open(&mut open_object)?;
+    let open_skel = skel_builder.open(&mut open_object)?;
     open_skel.maps.rodata_data.filter_enabled = filter_enabled;
     let mut skel = open_skel.load().context("loading eBPF object")?;
 
