@@ -7,7 +7,12 @@ with the kernel floor and the failure mode. CO-RE fails loudly at load if a
 relocation cannot be resolved (it does not read garbage), so a break shows up
 as a clear load error, not a wrong number.
 
-## Shared floor (all gadgets)
+The `resident` gadget is the exception to everything below: it is pure userspace
+(mmap + `mincore`), no BPF and no BTF, so none of the kernel-floor or capability
+requirements here apply to it. It builds and runs on any Linux with a `/proc`.
+This matrix covers the four eBPF gadgets only.
+
+## Shared floor (the eBPF gadgets)
 
 | Requirement | Kernel | Note |
 |---|---|---|

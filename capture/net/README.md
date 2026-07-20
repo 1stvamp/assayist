@@ -39,6 +39,11 @@ Build and kernel requirements match the other gadgets (BTF kernel, clang + bpfto
 - **Size, not latency.** This gadget counts and sizes packets; it does not measure per-packet or RTT latency (that needs flow tracking, a separate concern). Throughput = bytes / window from the counters.
 - **cgroup vs tap.** Per-guest keying assumes one tap per guest, which holds for Firecracker. A bridged or shared-interface setup collapses guests onto one key.
 
+## See also
+
+Fragment shape and self-metrics: [`../../docs/contract-v0.md`](../../docs/contract-v0.md).
+Flags across all gadgets: [`../../docs/config-reference.md`](../../docs/config-reference.md).
+
 ## Licence
 
 eBPF object GPL-2.0, userspace Apache-2.0, same split as the other gadgets.

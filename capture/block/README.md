@@ -34,6 +34,11 @@ Block completion runs in softirq/IRQ context, where the current task is not the 
 - **Tracepoint struct names.** `block_rq_complete` maps to `trace_event_raw_block_rq_completion` on current kernels; pre-4.x naming differed. CO-RE fails loudly at load if the struct is not present rather than reading garbage. Carries a compatibility-matrix entry.
 - **read/write only.** Flush and discard are folded into write. If you need them split out, extend the `is_write` classification.
 
+## See also
+
+Fragment shape and self-metrics: [`../../docs/contract-v0.md`](../../docs/contract-v0.md).
+Flags across all gadgets: [`../../docs/config-reference.md`](../../docs/config-reference.md).
+
 ## Licence
 
 eBPF object GPL-2.0, userspace Apache-2.0, same split as the other gadgets.

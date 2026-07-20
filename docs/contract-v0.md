@@ -212,8 +212,14 @@ name: firecracker-boot-snapshot
 target:
   adapter: firecracker
   version: ">=0.3"
+  config:
+    kernel: /var/lib/assayist/vmlinux
+    rootfs: /var/lib/assayist/rootfs.ext4
 workload:
   driver: fio-libaio
+  config:
+    filename: /dev/vdb
+    rw: randread
 gate:
   mode: ab_permutation
   p_threshold: 0.01
@@ -224,14 +230,14 @@ parameterise:
   vcpu: [1, 2, 4]
   mem_mib: [256, 512]
 capture:
-  - probe: kvm_exit_latency
-    attach: tp_btf
-    aggregate: log2_histogram
+  - probe: kvm_exit
+    gadget: assayist-capture-kvm
+    attach: tracepoint
     cardinality: { class: singleton }
-  - probe: restore_pagefaults
-    attach: fentry
-    aggregate: counter
-    cardinality: { class: bounded, key_source: guest_index, max_keys: 1 }
+  - probe: block_rq_complete
+    gadget: assayist-capture-block
+    attach: tracepoint
+    cardinality: { class: bounded, key_source: device, max_keys: 256 }
 host_prep:
   cpu_governor: performance
   smt: off
@@ -240,7 +246,11 @@ host_prep:
 tenancy: single_tenant
 ```
 
+A capture entry is `probe` (the series-source id), `gadget` (the capture binary to run), `cardinality` (required, class `singleton` or `bounded`), and optionally `attach` (declared attach kind, so the uprobe-on-hot-path check can fire), `hot_path`, and `args` (extra flags passed to the gadget verbatim). There is no `aggregate` key: the histogram-vs-counter shape is the gadget's, emitted in its fragment, not something the def declares. `docs/config-reference.md` has the full key set for every adapter, workload, and gadget.
+
 Load-time checks run against this before any capture: every capture entry has a cardinality decl (else reject), no uprobe on a hot path, host_prep is applied and read back. Only then does the run start.
+
+The `gate:` block here is a subset of the standalone `assayist-gate` CLI: a def sets `mode`, `p_threshold`, `noise_threshold`, `resamples`, and `ignore`, but not `min_effect`, `drift_k`, `seed`, or `strict_single_cell` (those are CLI-only in v0, see `crates/gate/README.md`). Set them on the gate invocation, not in the def, until the def surface grows to cover them.
 
 ## Versioning and stability
 

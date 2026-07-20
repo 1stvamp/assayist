@@ -43,7 +43,7 @@ Parca, Grafana Pyroscope, Pixie, DeepFlow all sample whole-system stacks at typi
 
 BMC (NSDI'21, memcached at XDP, up to 18x), XRP (OSDI'22 best paper, storage functions in the NVMe driver), Electrode (NSDI'23, Multi-Paxos, +128% throughput / -42% latency), lambda-IO (FAST'23, computational storage, up to 5.12x), sched_ext/scx (BPF schedulers, mainline in Linux 6.12), eBPF-mm and FetchBPF (memory management / prefetching), and SOSP'25 BPF page-cache policy work. Every one builds a bespoke harness; none share a standardised one. The gate's subsystem_triad mode (A/B vs vanilla + the eBPF program's own cost + end-to-end KPIs) is the missing reusable harness for this class.
 
-Note: the "bpfolio" project named in the original brief does not appear under that spelling; the active eBPF paging/memory work is eBPF-mm (arXiv:2409.11220), FetchBPF (ATC'24), a CMU learned-virtual-memory effort, and the SOSP'25 page-cache work.
+Note: this is a literature-search caveat only. bpfolio (formerly snapbpf) is Trigger.dev's own Firecracker snapshot-prefetch project and Assayist's primary consumer, not a published paper, so it does not show up under that spelling in the survey. The published eBPF paging/memory work is a separate line: eBPF-mm (arXiv:2409.11220), FetchBPF (ATC'24), a CMU learned-virtual-memory effort, and the SOSP'25 page-cache work.
 
 ## How this maps to Assayist
 

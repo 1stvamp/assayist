@@ -1,5 +1,10 @@
 # A benchmark definition. Committed next to the code under test; its hash
 # becomes identity.benchmark_def_sha in every AssayRun it produces.
+#
+# Before this runs you need a Firecracker kernel and rootfs at the paths below
+# (edit them, or drop your own images there). vcpu/mem_mib come from the
+# parameterise cells, not from config. The full key set for every adapter and
+# workload is in docs/config-reference.md.
 apiVersion: assayist/v0
 name: firecracker-boot-snapshot
 target:

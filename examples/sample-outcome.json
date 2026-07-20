@@ -1,0 +1,67 @@
+{
+  "outcome": {
+    "notes": [],
+    "per_metric": {
+      "kvm.exit_handling_latency:HLT|mean": {
+        "delta": 0.0016205795874790535,
+        "noisy": false,
+        "p": 0.791920807919208,
+        "significant": false
+      },
+      "kvm.exit_handling_latency:HLT|p50": {
+        "delta": 0.0,
+        "noisy": false,
+        "p": 1.0,
+        "significant": false
+      },
+      "kvm.exit_handling_latency:HLT|p99": {
+        "delta": 0.0,
+        "noisy": false,
+        "p": 1.0,
+        "significant": false
+      }
+    },
+    "verdict": "pass"
+  },
+  "report": {
+    "detail": [
+      {
+        "cells": ["c1"],
+        "cov": 0.013912423669071791,
+        "id": "kvm.exit_handling_latency:HLT|mean",
+        "mean_a": 1004.6661253939416,
+        "mean_b": 1006.2942668089867,
+        "n_a": 10,
+        "n_b": 10,
+        "p": 0.791920807919208,
+        "rel_delta": 0.0016205795874790535,
+        "status": "stable"
+      },
+      {
+        "cells": ["c1"],
+        "cov": 0.0,
+        "id": "kvm.exit_handling_latency:HLT|p50",
+        "mean_a": 768.0,
+        "mean_b": 768.0,
+        "n_a": 10,
+        "n_b": 10,
+        "p": 1.0,
+        "rel_delta": 0.0,
+        "status": "stable"
+      },
+      {
+        "cells": ["c1"],
+        "cov": 0.0,
+        "id": "kvm.exit_handling_latency:HLT|p99",
+        "mean_a": 1536.0,
+        "mean_b": 1536.0,
+        "n_a": 10,
+        "n_b": 10,
+        "p": 1.0,
+        "rel_delta": 0.0,
+        "status": "stable"
+      }
+    ],
+    "mode": "ab_permutation"
+  }
+}
