@@ -49,6 +49,11 @@ Build and kernel requirements match the other gadgets.
 - **Run-queue latency, not app latency.** Long runqueue latency means the process waited for a CPU; it does not tell you what the process then did. Pair with the imported app metrics.
 - **Capturing all cgroups** (no `--cgroup`) works but is high-cardinality and high-cost; it exists for exploration, not for gated runs.
 
+## See also
+
+Fragment shape and self-metrics: [`../../docs/contract-v0.md`](../../docs/contract-v0.md).
+Flags across all gadgets: [`../../docs/config-reference.md`](../../docs/config-reference.md).
+
 ## Licence
 
 eBPF object GPL-2.0, userspace Apache-2.0, same split as the other gadgets.

@@ -85,6 +85,12 @@ Names are a convenience; the histogram is always keyed on the numeric reason. In
 - **cgroup id as the guest key** assumes one guest per cgroup (jailer / K8s pod), which holds for Firecracker-in-pod and the jailer, but a deployment that packs multiple guests into one cgroup will collapse them. Check your layout before trusting per-guest keying.
 - **Not a whole run.** This emits a fragment. It does not gate, fingerprint, or decide anything; that is the orchestrator and gate's job.
 
+## See also
+
+The fragment shape and the `ProbeCost` self-metrics are defined in
+[`../../docs/contract-v0.md`](../../docs/contract-v0.md); this gadget's flags sit
+alongside the others in [`../../docs/config-reference.md`](../../docs/config-reference.md).
+
 ## Licence
 
 The eBPF object (`src/bpf/kvm.bpf.c`) is GPL-2.0 (tracing helpers require it). The userspace loader is Apache-2.0. This split is normal for a libbpf tool and keeps the loadable object GPL-clean while the rest of Assayist stays Apache-2.0.
