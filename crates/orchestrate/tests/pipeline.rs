@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 //! End-to-end pipeline test: drive the real `assayist run` binary over a def
 //! whose target/workload are no-op command adapters and whose one gadget is a

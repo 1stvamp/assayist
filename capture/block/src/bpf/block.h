@@ -1,3 +1,4 @@
+/* SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Shared types for the block-IO capture gadget. */
 #ifndef __ASSAYIST_BLOCK_H

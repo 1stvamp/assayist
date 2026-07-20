@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: GPL-2.0
 // Assayist tap/virtio-net capture gadget: host-side, per-interface, low cost.
 //

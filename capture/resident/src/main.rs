@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 //! Snapshot residency capture: how much of a snapshot's memory file is resident
 //! in the host page cache. It mmaps the file and calls mincore(2) at the end of

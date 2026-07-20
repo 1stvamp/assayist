@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: GPL-2.0
 // Assayist KVM capture gadget: host-side, agentless, in-kernel aggregation.
 //
