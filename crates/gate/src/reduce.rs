@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 // Reduce an AssayRun (as serde_json::Value) to a flat set of scalar metrics.
 // Histograms become mean/p50/p99; counters and gauges become value (and rate

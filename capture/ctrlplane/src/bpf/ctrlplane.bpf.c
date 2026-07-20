@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: GPL-2.0
 // Assayist control-plane capture gadget: host-side scheduler-treatment signal.
 //

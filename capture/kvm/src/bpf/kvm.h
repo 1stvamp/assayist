@@ -1,3 +1,4 @@
+/* SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Shared types between the eBPF object and the userspace loader. */
 #ifndef __ASSAYIST_KVM_H

@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 // assayist: the orchestrator. Reads a benchmark def, prepares the host, runs the
 // target + workload, fires capture gadgets, assembles graded AssayRuns, and

@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 // Assayist tap/virtio-net capture gadget, userspace side. Emits an AssayRun fragment.
 

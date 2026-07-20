@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 // Small, dependency-free statistics for the gate. Deterministic: the
 // permutation test uses a fixed-seed PRNG so a given input always yields the

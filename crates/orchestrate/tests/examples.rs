@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 //! Guard: every committed `examples/*.assay.yaml` must parse, validate, and
 //! expand cleanly. `assayist inspect` does exactly that (and observes the host

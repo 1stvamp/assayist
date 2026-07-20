@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Wesley Mason (1stvamp)
 // SPDX-License-Identifier: Apache-2.0
 //! Benchmark-definition parsing, hashing, validation, and matrix expansion.
 //!

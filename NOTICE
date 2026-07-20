@@ -1,0 +1,7 @@
+Assayist
+Copyright 2026 Wesley Mason (1stvamp)
+
+This product is licensed under the Apache License, Version 2.0 (userspace)
+with the eBPF objects under capture/*/src/bpf/*.bpf.c licensed under GPL-2.0,
+because kernel tracing helpers require it. The per-file SPDX headers are
+authoritative; see LICENSE-APACHE and LICENSE-GPL for the full texts.
