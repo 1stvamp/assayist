@@ -6,18 +6,17 @@ Reach for it when you want CI-gradeable A/B benchmarks of a guest workload (a fu
 
 Assayist does not try to standardise the thing under test. It standardises three things around it: a metric contract, a host/KVM-side eBPF capture plane, and a decision gate. Targets and workloads are pluggable adapters that plug into that fixed spine.
 
-```
-      target adapter                         workload driver
-      (what runs)                            (what loads it)
-            \                                    /
-             v                                  v
-   +-------------------------------------------------------+
-   |  SPINE                                                 |
-   |   contract   : one AssayRun record, OTLP-shaped        |
-   |   capture    : host/KVM-side eBPF, in-kernel aggreg.   |
-   |   gate       : permutation A/B, drift, subsystem triad |
-   |   orchestrate: run defs, host prep, assemble, decide   |
-   +-------------------------------------------------------+
+```mermaid
+flowchart TB
+    T["target adapter<br/>(what runs)"] --> S
+    W["workload driver<br/>(what loads it)"] --> S
+    subgraph S["spine (fixed)"]
+        direction TB
+        C["contract: one AssayRun record, OTLP-shaped"]
+        P["capture: host/KVM-side eBPF, in-kernel aggregation"]
+        G["gate: permutation A/B, drift, subsystem triad"]
+        O["orchestrate: run defs, host prep, assemble, decide"]
+    end
 ```
 
 The capture plane is universal because it sits host-side on KVM tracepoints and the virtio/tap path, so it observes a full VM, a Firecracker microVM, or a unikernel guest the same way, with no in-guest agent. So one system covers all of those guest types instead of a separate tool per space.

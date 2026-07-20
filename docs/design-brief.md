@@ -19,20 +19,18 @@ One system covers every space we care about (microVM lifecycle, host density, sc
 
 That is the whole trick: a fixed spine, two pluggable edges.
 
-```
-          target adapter                         workload driver
-          (what runs)                            (what loads it)
-                \                                    /
-                 \                                  /
-                  v                                v
-        +-----------------------------------------------------+
-        |  SPINE                                               |
-        |  - metric contract (schema + run identity)          |
-        |  - capture plane (host/KVM-side eBPF, AF_XDP)        |
-        |  - decision gate (A/B permutation + drift mode)      |
-        |  - orchestration + reproducibility                  |
-        |  - sinks (Prometheus/Grafana/Axiom/Better Stack)    |
-        +-----------------------------------------------------+
+```mermaid
+flowchart TB
+    T["target adapter<br/>(what runs)"] --> S
+    W["workload driver<br/>(what loads it)"] --> S
+    subgraph S["spine (fixed)"]
+        direction TB
+        C["metric contract (schema + run identity)"]
+        P["capture plane (host/KVM-side eBPF, AF_XDP)"]
+        G["decision gate (A/B permutation + drift mode)"]
+        O["orchestration + reproducibility"]
+        SK["sinks (Prometheus/Grafana/Axiom/Better Stack)"]
+    end
 ```
 
 Everything below is either a spine component (we build and own it, it stays stable) or an adapter (cheap to add, expected to multiply).
