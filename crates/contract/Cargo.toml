@@ -1,9 +1,14 @@
 [package]
 name = "assayist-contract"
-version = "0.0.0"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "Typed producer-side model of the Assayist metric contract"
+readme = "README.md"
+keywords = ["benchmark", "ebpf", "otlp", "firecracker", "kvm"]
+categories = ["development-tools::profiling", "development-tools::testing"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

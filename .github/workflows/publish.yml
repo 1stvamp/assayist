@@ -1,0 +1,51 @@
+name: Publish crates
+
+# Publishes the host-agnostic core to crates.io on a version tag. This runs on a
+# stock runner (unlike the tarball release in scripts/release.sh, which must be
+# cut from a BTF+KVM host) because these crates build anywhere. The four eBPF
+# gadgets are NOT published: they need per-host BTF/clang/bpftool. Only the
+# pure-userspace `resident` gadget is.
+#
+# Needs a CARGO_REGISTRY_TOKEN repo secret (a crates.io API token). Publishing is
+# dependency-ordered: contract, then otlp, then gate, then the assayist
+# orchestrator; cargo waits for each to land in the index before the next.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish (core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (rust + python from mise.toml)
+        uses: jdx/mise-action@v4
+
+      - name: Check the tag matches the crate version
+        # Guard against a tag that does not match workspace.package.version, so
+        # v0.1.3 cannot publish 0.1.4 by accident.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="assayist"))')"
+          if [ "$tag" != "$crate" ]; then
+            echo "tag $tag does not match crate version $crate" >&2
+            exit 1
+          fi
+
+      - name: Publish (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo publish -p assayist-contract
+          cargo publish -p assayist-otlp
+          cargo publish -p assayist-gate
+          cargo publish -p assayist
+          cargo publish --manifest-path capture/resident/Cargo.toml

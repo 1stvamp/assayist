@@ -37,7 +37,7 @@ That is the whole decision engine running end to end. The eBPF capture and the f
 ## Where to go
 
 - **Just want to see it work**: "Try it now" above.
-- **Consuming Assayist in another project** (like bpfolio): [Prebuilt releases](#prebuilt-releases-for-consumers), pull it with one mise entry.
+- **Consuming Assayist in another project** (like bpfolio): [Prebuilt releases](#prebuilt-releases-for-consumers), pull the full set with one mise entry, or [`cargo install`](#via-cargo-core-only) the core.
 - **Building from source**: [Build](#build).
 - **Running the full A/B pipeline**: [The full pipeline](#the-full-pipeline).
 - **Writing a benchmark def**: the exhaustive key/flag list is [`docs/config-reference.md`](docs/config-reference.md); worked feature walkthroughs are in [`docs/guides/`](docs/guides/README.md).
@@ -85,9 +85,23 @@ A downstream project does not need this source checkout. A tagged release ships 
 
 `mise install` then puts `assayist`, `assayist-gate`, and all five capture gadgets on `PATH` together (mise verifies the release's artifact attestations too), and the pinned version flows into each run's identity. The orchestrator shells out to `assayist-gate` for the A/B permutation, so both must be present. The per-host build above is only for developing the gadgets or running on an arch a release does not cover.
 
-Cut a release with `mise run release -- vX.Y.Z` (`scripts/release.sh`): it builds the orchestrator, the gate, and the gadgets, packages the tarball (`bin/` at the archive root), and creates the GitHub release. Releases are cut from a BTF+KVM host, not CI, because the gadgets compile against the host's BTF and stock GitHub runners have no KVM tracepoint structs (`trace_event_raw_kvm_exit`) in their kernel BTF. The binaries are CO-RE, so one cut on any same-arch KVM host runs everywhere.
+Cut a release with `mise run release -- vX.Y.Z` (`scripts/release.sh`): it builds the orchestrator, the gate, and the gadgets, packages the tarball (`bin/` at the archive root), and creates the GitHub release. Releases are cut from a BTF+KVM host, not CI, because the gadgets compile against the host's BTF and stock GitHub runners have no KVM tracepoint structs (`trace_event_raw_kvm_exit`) in their kernel BTF. The binaries are CO-RE, so one cut on any same-arch KVM host runs everywhere. The `vX.Y.Z` tag it creates also triggers the crates.io publish workflow (`.github/workflows/publish.yml`), which runs on a stock runner because the core builds anywhere; keep `workspace.package.version` in `Cargo.toml` in step with the tag.
 
 **Licence split**: userspace is Apache-2.0; the eBPF objects (`capture/*/src/bpf/*.bpf.c`) are GPL-2.0 because kernel tracing helpers require it. Per-file SPDX headers are authoritative. See `LICENSE-APACHE` and `LICENSE-GPL`.
+
+### Via cargo (core only)
+
+The core is on crates.io, so you can `cargo install` the binaries without a checkout:
+
+```
+cargo install assayist assayist-gate
+```
+
+That gives you the `assayist` orchestrator and the `assayist-gate` binary (the orchestrator shells out to the gate, so install both). `cargo install assayist-capture-resident` adds the residency gadget.
+
+**Note**: cargo delivers the host-agnostic core only. The four eBPF gadgets (kvm, block, net, ctrlplane) are not on crates.io: they need BTF, clang, and bpftool to build per host, so they are not `cargo install`-able. Via cargo you get the gate, the orchestrator's non-eBPF features (inspect, import/export, command adapters, the host-memory delta, per-guest residency, the resident gadget), and nothing that needs in-kernel capture. For the full set including the eBPF gadgets, use the mise release tarball above or build the gadgets per host. If you drive mise, `"cargo:assayist" = "0.1.3"` is the cargo-backed equivalent of the github entry, with the same limitation.
+
+The crate names: `assayist` (orchestrator binary), `assayist-gate`, `assayist-capture-resident`, plus the libraries `assayist-contract` and `assayist-otlp`.
 
 ## The gate
 

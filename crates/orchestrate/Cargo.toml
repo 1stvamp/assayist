@@ -1,17 +1,22 @@
 [package]
-name = "assayist-orchestrate"
-version = "0.0.0"
-edition = "2021"
-license = "Apache-2.0"
+name = "assayist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 description = "Assayist orchestrator: run benchmark defs, capture, assemble AssayRuns, gate"
+readme = "README.md"
+keywords = ["benchmark", "ebpf", "firecracker", "kvm", "microvm"]
+categories = ["development-tools::profiling", "development-tools::testing"]
 
 [[bin]]
 name = "assayist"
 path = "src/main.rs"
 
 [dependencies]
-assayist-contract = { path = "../contract" }
-assayist-otlp = { path = "../otlp" }
+assayist-contract.workspace = true
+assayist-otlp.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

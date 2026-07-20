@@ -1,6 +1,7 @@
-# assayist-orchestrate
+# assayist
 
-The orchestrator: it reads a benchmark def, prepares the host, drives the target
+The orchestrator crate (package `assayist`, binary `assayist`; the directory is
+`crates/orchestrate` for historical reasons). It reads a benchmark def, prepares the host, drives the target
 and workload across the capture window, assembles a graded `AssayRun` per repeat,
 and hands off to the gate. This is the `assayist` binary.
 

@@ -22,7 +22,7 @@ run = "cargo test --workspace"
 
 [tasks.test-pipeline]
 description = "Run the orchestrator end-to-end pipeline test"
-run = "cargo test -p assayist-orchestrate --test pipeline"
+run = "cargo test -p assayist --test pipeline"
 
 [tasks.test-gate]
 description = "Run the gate scenario suite: six verdicts and exit codes"
@@ -54,7 +54,7 @@ run = [
 
 [tasks.inspect]
 description = "Parse, validate and observe the example def (read-only)"
-run = "cargo run --release -p assayist-orchestrate -- inspect examples/firecracker-boot-snapshot.assay.yaml"
+run = "cargo run --release -p assayist -- inspect examples/firecracker-boot-snapshot.assay.yaml"
 
 [tasks.release]
 description = "Cut a GitHub release (build orchestrator + gadgets, package, gh release create). Needs a BTF+KVM host with clang + bpftool. Pass the version: mise run release -- v0.1.0 (DRY_RUN=1 to skip publishing)."
