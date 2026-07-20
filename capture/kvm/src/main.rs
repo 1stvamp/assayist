@@ -178,10 +178,10 @@ fn parse_hist_key(bytes: &[u8]) -> (u64, u32) {
 fn parse_hist(bytes: &[u8]) -> ([u32; MAX_SLOTS], u64) {
     let mut slots = [0u32; MAX_SLOTS];
     let mut count = 0u64;
-    for i in 0..MAX_SLOTS {
+    for (i, slot) in slots.iter_mut().enumerate() {
         let off = i * 4;
         let v = u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
-        slots[i] = v;
+        *slot = v;
         count += v as u64;
     }
     (slots, count)
@@ -194,9 +194,9 @@ fn main() -> Result<()> {
     // Enable self-accounting before load so we capture the whole window.
     let _stats_fd = enable_run_time_stats().context("enabling BPF run-time stats")?;
 
-    let mut skel_builder = KvmSkelBuilder::default();
+    let skel_builder = KvmSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
-    let mut open_skel = skel_builder.open(&mut open_object)?;
+    let open_skel = skel_builder.open(&mut open_object)?;
     open_skel.maps.rodata_data.per_guest = args.per_guest;
 
     let mut skel = open_skel.load().context("loading eBPF object")?;

@@ -127,10 +127,10 @@ fn parse_blk_stat(bytes: &[u8]) -> ([u32; MAX_SLOTS], u64, u64) {
     // struct blk_stat { u32 slots[40]; u64 bytes; }
     let mut slots = [0u32; MAX_SLOTS];
     let mut count = 0u64;
-    for i in 0..MAX_SLOTS {
+    for (i, slot) in slots.iter_mut().enumerate() {
         let off = i * 4;
         let v = u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
-        slots[i] = v;
+        *slot = v;
         count += v as u64;
     }
     let bytes_off = MAX_SLOTS * 4;
@@ -144,7 +144,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let _stats_fd = enable_run_time_stats().context("enabling BPF run-time stats")?;
 
-    let mut skel_builder = BlockSkelBuilder::default();
+    let skel_builder = BlockSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_object)?;
     let mut skel = open_skel.load().context("loading eBPF object")?;

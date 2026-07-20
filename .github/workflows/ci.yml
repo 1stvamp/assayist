@@ -33,6 +33,12 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Clippy the resident gadget (pure userspace, no BTF)
+        # The eBPF gadgets need a BTF host + clang, so they cannot be linted on a
+        # stock runner; they are gated in scripts/release.sh instead (mise run
+        # lint-gadgets). resident is pure userspace, so lint it here on every PR.
+        run: cargo clippy --manifest-path capture/resident/Cargo.toml --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --workspace
 

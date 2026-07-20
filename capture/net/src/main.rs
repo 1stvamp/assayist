@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::{MapCore, TcHookBuilder, TC_EGRESS};
 use serde_json::{json, Value};
 
@@ -148,14 +148,14 @@ fn parse_if_stat(bytes: &[u8]) -> (u64, u64, u64, u64, [u32; SIZE_BUCKETS], [u32
     let mut rx_size = [0u32; SIZE_BUCKETS];
     let mut tx_size = [0u32; SIZE_BUCKETS];
     let base = 32;
-    for i in 0..SIZE_BUCKETS {
+    for (i, slot) in rx_size.iter_mut().enumerate() {
         let o = base + i * 4;
-        rx_size[i] = u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
+        *slot = u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
     }
     let base2 = base + SIZE_BUCKETS * 4;
-    for i in 0..SIZE_BUCKETS {
+    for (i, slot) in tx_size.iter_mut().enumerate() {
         let o = base2 + i * 4;
-        tx_size[i] = u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
+        *slot = u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
     }
     (rx_packets, rx_bytes, tx_packets, tx_bytes, rx_size, tx_size)
 }
@@ -165,10 +165,10 @@ fn main() -> Result<()> {
     let ifaces = target_ifaces(&args)?;
     let _stats_fd = enable_run_time_stats().context("enabling BPF run-time stats")?;
 
-    let mut skel_builder = NetSkelBuilder::default();
+    let skel_builder = NetSkelBuilder::default();
     let mut open_object = MaybeUninit::uninit();
     let open_skel = skel_builder.open(&mut open_object)?;
-    let mut skel = open_skel.load().context("loading eBPF object")?;
+    let skel = open_skel.load().context("loading eBPF object")?;
 
     // Attach XDP (RX) to every target interface, sharing the one stats map.
     let mut _xdp_links = Vec::new();
