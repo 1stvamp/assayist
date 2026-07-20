@@ -8,10 +8,9 @@ Assayist does not try to standardise the thing under test. It standardises three
 
 ```mermaid
 flowchart TB
-    T["target adapter<br/>(what runs)"] --> S
-    W["workload driver<br/>(what loads it)"] --> S
-    subgraph S["spine (fixed)"]
-        direction TB
+    T["target adapter (what runs)"] --> C
+    W["workload driver (what loads it)"] --> C
+    subgraph spine
         C["contract: one AssayRun record, OTLP-shaped"]
         P["capture: host/KVM-side eBPF, in-kernel aggregation"]
         G["gate: permutation A/B, drift, subsystem triad"]

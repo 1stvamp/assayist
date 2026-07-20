@@ -21,10 +21,9 @@ That is the whole trick: a fixed spine, two pluggable edges.
 
 ```mermaid
 flowchart TB
-    T["target adapter<br/>(what runs)"] --> S
-    W["workload driver<br/>(what loads it)"] --> S
-    subgraph S["spine (fixed)"]
-        direction TB
+    T["target adapter (what runs)"] --> C
+    W["workload driver (what loads it)"] --> C
+    subgraph spine
         C["metric contract (schema + run identity)"]
         P["capture plane (host/KVM-side eBPF, AF_XDP)"]
         G["decision gate (A/B permutation + drift mode)"]
