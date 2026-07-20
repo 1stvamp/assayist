@@ -67,4 +67,6 @@ cargo build --release
 cargo test          # stats unit tests
 ```
 
-Builds on stable Rust (tested on 1.75). Apache-2.0.
+Builds on stable Rust (the workspace pins 1.97.0 in `rust-toolchain.toml`). Apache-2.0.
+
+The record shapes it consumes and emits (`AssayRun`, `GateContext`, `Outcome`, `MetricSeries`, `ProbeCost`) are defined in [`../../docs/contract-v0.md`](../../docs/contract-v0.md).
