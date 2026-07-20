@@ -11,18 +11,17 @@ For the reasoning behind this shape (the overhead evidence, why the contract is
 the expensive piece, the agentless-KVM insight) see [`design-brief.md`](design-brief.md)
 and [`research-survey.md`](research-survey.md).
 
-```
-      target adapter                         workload driver
-      (what runs)                            (what loads it)
-            \                                    /
-             v                                  v
-   +-------------------------------------------------------+
-   |  SPINE                                                 |
-   |   contract   : one AssayRun record, OTLP-shaped        |
-   |   capture    : host/KVM-side eBPF, in-kernel aggreg.   |
-   |   gate       : permutation A/B, drift, subsystem triad |
-   |   orchestrate: run defs, host prep, assemble, decide   |
-   +-------------------------------------------------------+
+```mermaid
+flowchart TB
+    T["target adapter<br/>(what runs)"] --> S
+    W["workload driver<br/>(what loads it)"] --> S
+    subgraph S["spine (fixed)"]
+        direction TB
+        C["contract: one AssayRun record, OTLP-shaped"]
+        P["capture: host/KVM-side eBPF, in-kernel aggregation"]
+        G["gate: permutation A/B, drift, subsystem triad"]
+        O["orchestrate: run defs, host prep, assemble, decide"]
+    end
 ```
 
 ## The spine (workspace crates)
@@ -78,11 +77,19 @@ Each gadget has its own README under `capture/<name>/`.
 
 ## Data flow
 
-```
-gadget --> fragment --\
-gadget --> fragment ----> orchestrator --> AssayRun (graded) --\
-gadget --> fragment --/                                         > gate --> verdict
-                                          AssayRun (graded) --/
+```mermaid
+flowchart LR
+    g1["gadget"] --> f1["fragment"]
+    g2["gadget"] --> f2["fragment"]
+    g3["gadget"] --> f3["fragment"]
+    f1 --> O["orchestrator"]
+    f2 --> O
+    f3 --> O
+    O --> A["AssayRun graded (group A)"]
+    O --> B["AssayRun graded (group B)"]
+    A --> GT["gate"]
+    B --> GT
+    GT --> V["verdict"]
 ```
 
 1. The orchestrator reads a def, applies host prep, reads the applied state back
