@@ -27,11 +27,11 @@ cargo build --release
 # workspace, so CI's `cargo clippy --workspace` never sees them; this is where
 # gadget warnings get caught (set -e aborts the release on any).
 echo "linting capture gadgets (clippy -D warnings)..."
-for g in kvm block net ctrlplane resident; do
+for g in kvm block net ctrlplane resident netattrib; do
   cargo clippy --manifest-path "capture/$g/Cargo.toml" --all-targets -- -D warnings
 done
 echo "building capture gadgets..."
-for g in kvm block net ctrlplane resident; do
+for g in kvm block net ctrlplane resident netattrib; do
   cargo build --release --manifest-path "capture/$g/Cargo.toml"
 done
 

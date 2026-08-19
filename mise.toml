@@ -36,7 +36,7 @@ run = "cargo clippy --workspace --all-targets -- -D warnings"
 description = "Clippy the capture gadgets (excluded from the workspace, so `lint` skips them). Needs a BTF host + clang for the eBPF ones; resident is pure userspace."
 run = """
 set -e
-for g in kvm block net ctrlplane resident; do
+for g in kvm block net ctrlplane resident netattrib; do
   echo "clippy: capture/$g"
   cargo clippy --manifest-path "capture/$g/Cargo.toml" --all-targets -- -D warnings
 done
