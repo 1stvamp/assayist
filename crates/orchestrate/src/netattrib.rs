@@ -74,6 +74,7 @@ impl HandleTable {
         &mut self,
         vm_id: String,
         tap: String,
+        guest_mac: String,
         ifindex: u32,
         netns_inum: u32,
     ) -> u64 {
@@ -85,7 +86,7 @@ impl HandleTable {
                 handle,
                 vm_id,
                 tap,
-                guest_mac: guest_mac_for(handle),
+                guest_mac,
                 ifindex,
                 netns_inum,
             },
@@ -268,8 +269,8 @@ mod tests {
     #[test]
     fn handles_are_dense_and_start_at_zero() {
         let mut t = HandleTable::new();
-        let a = t.assign("01AAA".into(), "tap0".into(), 11, 4026531840);
-        let b = t.assign("01BBB".into(), "tap1".into(), 12, 4026531841);
+        let a = t.assign("01AAA".into(), "tap0".into(), "02:00:00:00:00:0a".into(), 11, 4026531840);
+        let b = t.assign("01BBB".into(), "tap1".into(), "02:00:00:00:00:0b".into(), 12, 4026531841);
         assert_eq!((a, b), (0, 1));
         assert_eq!(t.len(), 2);
         assert_eq!(t.get(a).unwrap().vm_id, "01AAA");
@@ -289,15 +290,18 @@ mod tests {
     #[test]
     fn provenance_json_is_sorted_and_complete() {
         let mut t = HandleTable::new();
-        t.assign("01AAA".into(), "tap0".into(), 11, 40);
-        t.assign("01BBB".into(), "tap1".into(), 12, 41);
+        // The MAC is the caller's to supply (the adapter that configures the
+        // device), not derived here, so assert it round-trips rather than
+        // asserting a value this table computed itself.
+        t.assign("01AAA".into(), "tap0".into(), "02:00:00:00:00:0a".into(), 11, 40);
+        t.assign("01BBB".into(), "tap1".into(), "02:00:00:00:00:0b".into(), 12, 41);
         let v = t.provenance_json();
         let arr = v.as_array().expect("provenance is an array");
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["handle"], 0);
         assert_eq!(arr[0]["vm_id"], "01AAA");
         assert_eq!(arr[0]["tap"], "tap0");
-        assert_eq!(arr[0]["guest_mac"], "02:00:00:00:00:00");
+        assert_eq!(arr[0]["guest_mac"], "02:00:00:00:00:0a");
         assert_eq!(arr[0]["ifindex"], 11);
         assert_eq!(arr[0]["netns_inum"], 40);
         assert_eq!(arr[1]["handle"], 1);
@@ -307,7 +311,7 @@ mod tests {
     #[test]
     fn rewrite_maps_handle_labels_to_ulids() {
         let mut t = HandleTable::new();
-        let h = t.assign("01ULID".into(), "tap0".into(), 11, 40);
+        let h = t.assign("01ULID".into(), "tap0".into(), "02:00:00:00:00:01".into(), 11, 40);
         let mut frags = vec![frag_with_vm_id(&h.to_string())];
         let unknown = rewrite_vm_id_labels(&mut frags, &t);
         assert!(unknown.is_empty(), "nothing unresolved, got {unknown:?}");
@@ -330,7 +334,7 @@ mod tests {
     #[test]
     fn rewrite_ignores_series_without_a_vm_id_label() {
         let mut t = HandleTable::new();
-        t.assign("01ULID".into(), "tap0".into(), 11, 40);
+        t.assign("01ULID".into(), "tap0".into(), "02:00:00:00:00:01".into(), 11, 40);
         let mut frags = vec![Fragment {
             series: vec![json!({
                 "name": "block.io_latency:read", "unit": "ns", "kind": "counter",

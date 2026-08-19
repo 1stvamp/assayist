@@ -35,7 +35,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 
-use crate::adapter::{render, Shell, Target, Workload};
+use crate::adapter::{render, NetAttribution, Shell, Target, Workload};
 
 /// Read a config key, render `{param}` refs, fall back to `default`.
 fn cfg(
@@ -148,6 +148,16 @@ pub struct FirecrackerTarget {
     /// `cpu_base + n`. The orchestrator sets a distinct base per concurrent
     /// instance (via the `cpu_base` var) so they do not all land on CPU 0.
     cpu_base: u32,
+    /// Host tap device for this instance, when the def asks for tap networking
+    /// (`network: tap`). `None` leaves the VM with no network interface, which
+    /// is the historical behaviour.
+    tap: Option<String>,
+    /// Deterministic locally-administered guest MAC, derived from the instance
+    /// index so concurrent instances cannot collide.
+    guest_mac: String,
+    /// The tap's ifindex, read from sysfs after the device exists. The
+    /// attribution map keys on it.
+    tap_ifindex: RefCell<Option<u32>>,
     spans: RefCell<Vec<Value>>,
     pinning: RefCell<Option<Value>>,
 }
@@ -192,6 +202,13 @@ pub fn firecracker_target(
     let stream_prefetch = matches!(g("stream_prefetch", "false").to_lowercase().as_str(), "stream" | "true" | "on");
     let stream_dir = format!("{}.stream.{}", sock, now_nanos());
 
+    // Tap networking is opt-in. The instance index (already used for the API
+    // socket) keeps tap names and MACs unique across concurrent instances.
+    let instance: u64 = vars.get("instance").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let tap = matches!(g("network", "").to_lowercase().as_str(), "tap")
+        .then(|| format!("asy{}-{}", std::process::id() % 100000, instance));
+    let guest_mac = crate::netattrib::guest_mac_for(instance);
+
     FirecrackerTarget {
         bin: g("bin", "firecracker"),
         sock,
@@ -214,6 +231,9 @@ pub fn firecracker_target(
         stream_dir,
         pin_threads,
         cpu_base: vars.get("cpu_base").and_then(|s| s.parse().ok()).unwrap_or(0),
+        tap,
+        guest_mac,
+        tap_ifindex: RefCell::new(None),
         spans: RefCell::new(Vec::new()),
         pinning: RefCell::new(None),
     }
@@ -432,7 +452,31 @@ impl Target for FirecrackerTarget {
             "is_read_only": false,
         })
         .to_string();
-        self.api(sh, "PUT", "/drives/rootfs", &drive)
+        self.api(sh, "PUT", "/drives/rootfs", &drive)?;
+
+        // Tap networking, when asked for. Created before the API call that
+        // names it, because Firecracker validates the device exists. The
+        // ifindex comes from sysfs rather than parsing `ip` output.
+        if let Some(tap) = &self.tap {
+            sh.run(&format!(
+                "ip tuntap del dev '{tap}' mode tap 2>/dev/null; \
+                 ip tuntap add dev '{tap}' mode tap && ip link set dev '{tap}' up"
+            ))?;
+            let idx = sh.run(&format!("cat '/sys/class/net/{tap}/ifindex'"))?;
+            let ifindex: u32 = idx
+                .trim()
+                .parse()
+                .map_err(|e| format!("parsing tap '{tap}' ifindex '{}': {e}", idx.trim()))?;
+            *self.tap_ifindex.borrow_mut() = Some(ifindex);
+            let iface = json!({
+                "iface_id": "eth0",
+                "host_dev_name": tap,
+                "guest_mac": self.guest_mac,
+            })
+            .to_string();
+            self.api(sh, "PUT", "/network-interfaces/eth0", &iface)?;
+        }
+        Ok(())
     }
 
     fn start(&self, sh: &dyn Shell) -> Result<(), String> {
@@ -512,11 +556,30 @@ impl Target for FirecrackerTarget {
             uds = self.uffd_uds(),
             stream = self.stream_dir,
         );
-        sh.run(&cmd).map(|_| ())
+        sh.run(&cmd)?;
+
+        // Best-effort tap cleanup: the VM is already gone, and a leaked tap
+        // would collide with the next run on this instance index.
+        if let Some(tap) = &self.tap {
+            let _ = sh.run(&format!("ip tuntap del dev '{tap}' mode tap"));
+        }
+        Ok(())
     }
 
     fn pinning_layout(&self) -> Option<Value> {
         self.pinning.borrow().clone()
+    }
+
+    fn net_attribution(&self, _sh: &dyn Shell) -> Option<NetAttribution> {
+        let tap = self.tap.clone()?;
+        Some(NetAttribution {
+            tap,
+            ifindex: (*self.tap_ifindex.borrow())?,
+            guest_mac: self.guest_mac.clone(),
+            // Host netns. Per-VM netns is not used: the tap lives in the host
+            // namespace, and netns is recorded for cross-check only.
+            netns_inum: 0,
+        })
     }
 
 
@@ -1935,5 +1998,62 @@ mod tests {
         let sh = FakeShell::new();
         let err = w.start(&sh).unwrap_err();
         assert!(err.contains("uds"), "{err}");
+    }
+
+    fn fc_config() -> BTreeMap<String, Value> {
+        config(&[("kernel", json!("/k/vmlinux")), ("rootfs", json!("/k/rootfs.ext4"))])
+    }
+
+    #[test]
+    fn firecracker_without_network_creates_no_tap() {
+        // The default is unchanged behaviour: no tap, nothing to attribute.
+        let sh = FakeShell::new();
+        let target = firecracker_target(&fc_config(), &BTreeMap::new(), false);
+        target.provision(&sh).unwrap();
+        assert!(!sh.saw("/network-interfaces"));
+        assert!(!sh.saw("ip tuntap add"));
+        assert!(target.net_attribution(&sh).is_none());
+    }
+
+    #[test]
+    fn firecracker_with_tap_networking_creates_configures_and_reports_it() {
+        let sh = FakeShell::new().reply("/sys/class/net/", "7\n");
+        let mut cfg = fc_config();
+        cfg.insert("network".to_string(), json!("tap"));
+        let mut v = vars(&[]);
+        v.insert("instance".to_string(), "2".to_string());
+        let target = firecracker_target(&cfg, &v, false);
+        target.provision(&sh).unwrap();
+
+        // Tap created and brought up before the API call that references it.
+        assert!(sh.saw("ip tuntap add"), "tap must be created");
+        assert!(sh.saw("ip link set"), "tap must be brought up");
+        // Firecracker told about the device, with the deterministic mac.
+        assert!(sh.saw("/network-interfaces"));
+        assert!(sh.saw("host_dev_name"));
+        assert!(sh.saw("02:00:00:00:00:02"), "guest mac derives from the instance");
+
+        let attrib = target.net_attribution(&sh).expect("tap networking reports attribution");
+        assert_eq!(attrib.guest_mac, "02:00:00:00:00:02");
+        assert!(attrib.tap.contains('2'), "tap name carries the instance: {}", attrib.tap);
+    }
+
+    #[test]
+    fn firecracker_teardown_deletes_the_tap() {
+        // provision's own tap command already contains a guard `ip tuntap del`
+        // (it clears a possible stale device before `add`), so a bare
+        // `sh.saw("ip tuntap del")` after teardown would pass even if teardown
+        // issued no delete at all. Count occurrences instead: teardown must add
+        // exactly one more over what provision already left behind.
+        let sh = FakeShell::new().reply("/sys/class/net/", "7\n");
+        let mut cfg = fc_config();
+        cfg.insert("network".to_string(), json!("tap"));
+        let target = firecracker_target(&cfg, &BTreeMap::new(), false);
+        target.provision(&sh).unwrap();
+
+        let before = sh.seen.borrow().iter().filter(|c| c.contains("ip tuntap del")).count();
+        target.teardown(&sh).unwrap();
+        let after = sh.seen.borrow().iter().filter(|c| c.contains("ip tuntap del")).count();
+        assert_eq!(after, before + 1, "teardown must issue its own tap delete, not just reuse provision's guard delete");
     }
 }
