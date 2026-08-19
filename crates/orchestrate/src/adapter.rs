@@ -48,6 +48,20 @@ impl Shell for SystemShell {
     }
 }
 
+/// A target's network attribution identity: the host tap it owns and the
+/// numbers the attribution map needs. Returned by targets that set up
+/// networking; `None` from everything else.
+/// Task 4 returns this from the firecracker target; Task 5 consumes it in
+/// the run driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct NetAttribution {
+    pub tap: String,
+    pub ifindex: u32,
+    pub guest_mac: String,
+    pub netns_inum: u32,
+}
+
 pub trait Target {
     fn version(&self, sh: &dyn Shell) -> String;
     fn provision(&self, sh: &dyn Shell) -> Result<(), String>;
@@ -70,6 +84,15 @@ pub trait Target {
     /// cannot give (the delta is system-wide). Adapter-specific, default none.
     fn resident_files(&self) -> Vec<(String, String)> {
         Vec::new()
+    }
+    /// The tap identity this target set up, if it did. The run driver uses it to
+    /// assign a handle and drive the attribution map. Defaulted to `None` so
+    /// every existing target is unaffected: the adapter stays free of BPF and
+    /// sockets, and only a target that actually creates a tap reports one.
+    /// Task 5 calls this from the run driver.
+    #[allow(dead_code)]
+    fn net_attribution(&self, _sh: &dyn Shell) -> Option<NetAttribution> {
+        None
     }
 }
 

@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 
 /// Lifecycle states, matching the shared map ABI byte for byte. Fixed by the
 /// spec: sub-project 4's eBPF programs read this same value.
-/// Task 3 consumes these constants.
+/// Task 3's `state_name` consumes these; Task 5 wires the control client into
+/// the run driver, so they stay unreachable from `main` until then.
 #[allow(dead_code)]
 pub const LIFECYCLE_RUNNING: u8 = 0;
 #[allow(dead_code)]
@@ -157,11 +158,98 @@ pub fn rewrite_vm_id_labels(fragments: &mut [Fragment], table: &HandleTable) -> 
     unknown
 }
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+
+/// The wire name for a lifecycle state byte, as the owner's protocol expects.
+/// Task 5 wires the control client into the run driver.
+#[allow(dead_code)]
+pub fn state_name(state: u8) -> &'static str {
+    match state {
+        LIFECYCLE_PAUSING => "PAUSING",
+        LIFECYCLE_PAUSED => "PAUSED",
+        LIFECYCLE_RESUMING => "RESUMING",
+        _ => "RUNNING",
+    }
+}
+
+/// Request/reply client for the owner gadget's control socket. Every command
+/// waits for its reply, so a slow owner applies backpressure instead of the
+/// orchestrator dropping map updates on the floor.
+/// Task 5 wires this into the run driver.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ControlClient {
+    reader: BufReader<UnixStream>,
+}
+
+impl ControlClient {
+    /// Connect, retrying until `timeout`: the owner is a freshly spawned
+    /// subprocess, so its socket may not exist yet.
+    #[allow(dead_code)]
+    pub fn connect(path: &str, timeout: Duration) -> Result<ControlClient, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match UnixStream::connect(path) {
+                Ok(s) => {
+                    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    return Ok(ControlClient { reader: BufReader::new(s) });
+                }
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!("control socket {path} never accepted: {e}"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn command(&mut self, line: &str) -> Result<(), String> {
+        self.reader
+            .get_mut()
+            .write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("sending '{line}': {e}"))?;
+        self.reader.get_mut().flush().map_err(|e| format!("flushing '{line}': {e}"))?;
+        let mut reply = String::new();
+        self.reader
+            .read_line(&mut reply)
+            .map_err(|e| format!("reading reply to '{line}': {e}"))?;
+        let reply = reply.trim();
+        match reply.strip_prefix("err") {
+            Some(msg) => Err(format!("attribution owner rejected '{line}':{msg}")),
+            None if reply == "ok" => Ok(()),
+            None => Err(format!("unexpected reply to '{line}': {reply:?}")),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn add(&mut self, ifindex: u32, handle: u64, netns_inum: u32) -> Result<(), String> {
+        self.command(&format!("add {ifindex} {handle} {netns_inum}"))
+    }
+
+    #[allow(dead_code)]
+    pub fn state(&mut self, handle: u64, state: u8) -> Result<(), String> {
+        self.command(&format!("state {handle} {}", state_name(state)))
+    }
+
+    #[allow(dead_code)]
+    pub fn remove(&mut self, handle: u64) -> Result<(), String> {
+        self.command(&format!("remove {handle}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use assayist_contract::Fragment;
     use serde_json::json;
     use crate::netattrib::{guest_mac_for, rewrite_vm_id_labels, HandleTable};
+    use crate::netattrib::{
+        state_name, ControlClient, LIFECYCLE_PAUSED, LIFECYCLE_PAUSING, LIFECYCLE_RESUMING,
+        LIFECYCLE_RUNNING,
+    };
 
     fn frag_with_vm_id(vm_id: &str) -> Fragment {
         Fragment {
@@ -256,5 +344,79 @@ mod tests {
         let unknown = rewrite_vm_id_labels(&mut frags, &t);
         assert!(unknown.is_empty());
         assert!(frags[0].series[0].get("labels").is_none());
+    }
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    /// A fake owner: accepts one connection, replies to each line from `replies`
+    /// in order, and records what it received. Returns the recording handle.
+    fn fake_owner(path: String, replies: Vec<&'static str>) -> std::thread::JoinHandle<Vec<String>> {
+        let listener = UnixListener::bind(&path).expect("bind fake owner");
+        std::thread::spawn(move || {
+            let mut got = Vec::new();
+            let (s, _) = listener.accept().expect("accept");
+            let mut r = BufReader::new(s);
+            for reply in replies {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                got.push(line.trim().to_string());
+                let _ = r.get_mut().write_all(reply.as_bytes());
+                let _ = r.get_mut().flush();
+            }
+            got
+        })
+    }
+
+    fn sock_path(name: &str) -> String {
+        let p = std::env::temp_dir().join(format!("assayist-test-{}-{}.sock", name, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn state_names_match_the_wire_protocol() {
+        assert_eq!(state_name(LIFECYCLE_RUNNING), "RUNNING");
+        assert_eq!(state_name(LIFECYCLE_PAUSING), "PAUSING");
+        assert_eq!(state_name(LIFECYCLE_PAUSED), "PAUSED");
+        assert_eq!(state_name(LIFECYCLE_RESUMING), "RESUMING");
+    }
+
+    #[test]
+    fn client_sends_the_wire_format_and_accepts_ok() {
+        let path = sock_path("wire");
+        let owner = fake_owner(path.clone(), vec!["ok\n", "ok\n", "ok\n"]);
+        let mut c = ControlClient::connect(&path, Duration::from_secs(2)).expect("connect");
+        c.add(11, 0, 4026531840).expect("add");
+        c.state(0, LIFECYCLE_PAUSED).expect("state");
+        c.remove(0).expect("remove");
+        let got = owner.join().expect("owner thread");
+        assert_eq!(
+            got,
+            vec!["add 11 0 4026531840", "state 0 PAUSED", "remove 0"]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn client_surfaces_an_err_reply() {
+        let path = sock_path("err");
+        let owner = fake_owner(path.clone(), vec!["err no entry for handle 5\n"]);
+        let mut c = ControlClient::connect(&path, Duration::from_secs(2)).expect("connect");
+        let e = c.remove(5).expect_err("err reply must be an error");
+        assert!(e.contains("no entry for handle 5"), "got: {e}");
+        let _ = owner.join();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn connect_times_out_when_no_owner_is_listening() {
+        let path = sock_path("absent");
+        let e = ControlClient::connect(&path, Duration::from_millis(200))
+            .expect_err("no listener means connect fails");
+        assert!(e.contains("control socket"), "got: {e}");
     }
 }
