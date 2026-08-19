@@ -21,6 +21,7 @@ mod def;
 mod gate;
 mod hostprep;
 mod native;
+mod netattrib;
 mod run;
 
 use std::collections::BTreeMap;
