@@ -292,4 +292,61 @@ mod tests {
         assert_eq!(run.series.len(), 1);
         assert_eq!(run.self_metrics.len(), 1);
     }
+
+    #[test]
+    fn schema_carries_labels_and_vm_id_key_source() {
+        // Pin the additive contract vocabulary the network gadgets depend on.
+        // The schema file is the authority; this guards against a silent drop.
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../contract/assay-run.schema.json"))
+                .expect("schema is valid JSON");
+
+        let series = &schema["$defs"]["MetricSeries"]["properties"];
+        assert!(
+            series.get("labels").is_some(),
+            "MetricSeries must declare an optional labels property"
+        );
+
+        let key_source_enum = schema["$defs"]["CardinalityDecl"]["properties"]["key_source"]["enum"]
+            .as_array()
+            .expect("key_source has an enum");
+        assert!(
+            key_source_enum.iter().any(|v| v == "vm_id"),
+            "key_source enum must include vm_id"
+        );
+    }
+
+    #[test]
+    fn schema_validates_a_labelled_series_and_rejects_a_non_scalar_label() {
+        // Exercise the labels addition against the real schema, not just its
+        // shape: a scalar-valued labels map validates, a non-scalar (nested
+        // object) label is rejected. MetricSeries is lifted into a standalone
+        // document carrying $defs, so its internal #/$defs refs (Scalar,
+        // CounterData, ...) still resolve.
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../contract/assay-run.schema.json"))
+                .expect("schema is valid JSON");
+        let series_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"],
+            "$ref": "#/$defs/MetricSeries"
+        });
+        let validator = jsonschema::JSONSchema::compile(&series_schema).expect("schema compiles");
+
+        let ok = json!({
+            "name": "net.softirq_ns", "unit": "ns", "kind": "counter", "source": "softirq",
+            "cardinality": { "class": "bounded", "key_source": "vm_id", "max_keys": 1024 },
+            "labels": { "vm_id": "01J", "lifecycle_state": "paused", "backend": "tap" },
+            "data": { "value": 5, "start_unix_nano": 0 }
+        });
+        assert!(validator.is_valid(&ok), "a scalar-labelled series must validate");
+
+        let bad = json!({
+            "name": "net.softirq_ns", "unit": "ns", "kind": "counter", "source": "softirq",
+            "cardinality": { "class": "singleton" },
+            "labels": { "vm_id": { "nested": true } },
+            "data": { "value": 5, "start_unix_nano": 0 }
+        });
+        assert!(!validator.is_valid(&bad), "a non-scalar label value must be rejected");
+    }
 }

@@ -13,3 +13,9 @@ categories = ["development-tools::profiling", "development-tools::testing"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+# Validates real instances against contract/assay-run.schema.json in tests, so
+# the schema is exercised (a labelled series validates, a malformed one is
+# rejected), not just parsed for shape. Dev-only: not carried by consumers.
+jsonschema = "0.18"

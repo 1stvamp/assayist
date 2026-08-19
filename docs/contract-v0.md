@@ -104,6 +104,7 @@ The continuous side. Histograms are the default and preferred kind, because in-k
 | `kind` | enum | MUST | `histogram` \| `counter` \| `gauge`. |
 | `source` | string | MUST | The probe id / tracepoint that produced it. Ties every number to its capture program. |
 | `key` | string | MAY | Present only for keyed (per-guest) series at density. Value drawn from a declared bounded key source. |
+| `labels` | map | MAY | Optional attribution dimensions a single `key` cannot carry, e.g. `vm_id`, `lifecycle_state`, `backend`. Values are scalars. The gate groups series like-for-like by the full label set and ignores label keys it does not recognise, so a run with no `labels` grades exactly as before. `labels` does not replace `key`: `key` stays the primary bounded-cardinality key, `labels` carries the rest. |
 | `cardinality` | `CardinalityDecl` | MUST | Declared, enforced at load. See budget. |
 | `data` | one of below | MUST | Kind-specific. |
 
@@ -128,7 +129,7 @@ This is the density-safety constraint, written as an actual load-time gate rathe
 | Field | Type | Notes |
 |---|---|---|
 | `class` | enum | `singleton` \| `bounded`. There is no `unbounded`. |
-| `key_source` | enum | Required if `bounded`. One of `vcpu_pid_map` \| `cgroup_id` \| `guest_index`. |
+| `key_source` | enum | Required if `bounded`. One of `vcpu_pid_map` \| `cgroup_id` \| `guest_index` \| `device` \| `netdev` \| `vm_id`. |
 | `max_keys` | int | Required if `bounded`. |
 
 Rules:
@@ -137,6 +138,15 @@ Rules:
 - A `bounded` series MUST name a `key_source` from the closed list. A key that does not derive from a declared bounded source MUST be rejected.
 - At capture time, if distinct keys for a series exceed `max_keys`, the capture layer MUST truncate and set a `cardinality_overflow` flag on the series, and MUST NOT grow the key space. An overflowed series marks the run `outcome: contaminated` for that metric.
 - A per-run global key ceiling MUST be configured (typically derived from guest count) and the sum of all series key counts MUST stay under it. Over the ceiling contaminates the run.
+
+Key source values:
+
+- `vcpu_pid_map`: per-vCPU attribution from a captured map of guest vCPU index to host PID.
+- `cgroup_id`: per-cgroup attribution from in-kernel cgroup tracking.
+- `guest_index`: per-guest (VM) attribution by ordinal index in a density run.
+- `device`: per-block-device or per-network-device attribution from kernel syscalls.
+- `netdev`: network device interface index.
+- `vm_id`: per-VM attribution from the network gadgets' shared attribution map (ifindex to vm_id).
 
 ## `ProbeCost` (observer-effect self-metrics)
 
