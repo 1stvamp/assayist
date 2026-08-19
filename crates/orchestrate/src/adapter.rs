@@ -220,6 +220,14 @@ pub struct RunArtifacts {
     pub fragments: Vec<Fragment>,
     pub spans: Vec<Value>,
     pub workload_report: Value,
+    /// Handle-to-ULID provenance for the VMs attributed this run, or `None`
+    /// when attribution was not enabled. Recorded as additive
+    /// `capture_meta.vm_attribution`.
+    /// Every call site passes `None` for the session until sub-project 3's
+    /// pause/resume hook wires one in and `main` attaches this to the
+    /// assembled record, so it goes unread until then.
+    #[allow(dead_code)]
+    pub vm_attribution: Option<Value>,
 }
 
 fn now_nanos() -> u64 {
@@ -476,6 +484,7 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
     target: &dyn Target,
     workload: &dyn Workload,
     gadgets: &[GadgetInvocation],
+    mut attrib: Option<&mut crate::netattrib::AttributionSession>,
 ) -> Result<RunArtifacts, String> {
     // Host memory before the target exists, and after it reaches steady: the
     // delta is the memory cost of preparing and restoring the guest, measured
@@ -485,6 +494,47 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
     target.start(sh)?;
     target.reach_steady(sh)?;
     let mem_after = sample_meminfo(sh);
+
+    // Attribution, when enabled and the target actually set up a tap. Register
+    // after steady so the tap exists and its ifindex is known, and before the
+    // gadgets attach so their first samples are already attributable. Only the
+    // handle (not the session borrow) is carried across the gadget spawn/wait
+    // below; the session is re-borrowed afterwards to deregister and rewrite.
+    let mut attributed_handle: Option<u64> = None;
+    if let Some(session) = attrib.as_deref_mut() {
+        match target.net_attribution(sh) {
+            Some(na) => {
+                let handle = match session.register(
+                    crate::run::new_run_id(),
+                    na.tap,
+                    na.guest_mac,
+                    na.ifindex,
+                    na.netns_inum,
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = target.teardown(sh);
+                        return Err(e);
+                    }
+                };
+                if let Err(e) = session.set_state(handle, crate::netattrib::LIFECYCLE_RUNNING) {
+                    let _ = target.teardown(sh);
+                    return Err(e);
+                }
+                attributed_handle = Some(handle);
+            }
+            None => {
+                // A run that asked for attribution but whose target set up no
+                // tap is a config error, not a silent no-op: every later
+                // network sample would be unattributable.
+                let _ = target.teardown(sh);
+                return Err(
+                    "attribution enabled but the target reports no tap; set `network: tap` on the target"
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     let mut handles = Vec::with_capacity(gadgets.len());
     for inv in gadgets {
@@ -534,7 +584,21 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
         fragments.push(f);
     }
 
-    Ok(RunArtifacts { fragments, spans, workload_report })
+    let vm_attribution = match (attributed_handle, attrib) {
+        (Some(handle), Some(session)) => {
+            let _ = session.deregister(handle);
+            let unknown = crate::netattrib::rewrite_vm_id_labels(&mut fragments, &session.table);
+            let mut prov = json!({ "vms": session.table.provenance_json() });
+            if !unknown.is_empty() {
+                // Handles the orchestrator never issued mean a stale map.
+                prov["unresolved_handles"] = json!(unknown);
+            }
+            Some(prov)
+        }
+        _ => None,
+    };
+
+    Ok(RunArtifacts { fragments, spans, workload_report, vm_attribution })
 }
 
 #[cfg(test)]
@@ -548,6 +612,7 @@ mod tests {
 
     /// Records the commands it was asked to run and returns canned stdout keyed
     /// by a substring match, so tests assert ordering and templating.
+    #[derive(Default)]
     struct FakeShell {
         seen: RefCell<Vec<String>>,
         replies: HashMap<String, String>,
@@ -573,6 +638,7 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct FakeRunner {
         frag: Fragment,
     }
@@ -662,7 +728,7 @@ mod tests {
         }];
         let plan = plan_gadgets(&entries, 1, Path::new("/tmp"), &BTreeMap::new()).unwrap();
 
-        let art = execute_run(&sh, &runner, &target, &workload, &plan).unwrap();
+        let art = execute_run(&sh, &runner, &target, &workload, &plan, None).unwrap();
         // The gadget fragment plus the synthesized hostmem fragment.
         assert_eq!(art.fragments.len(), 2);
         assert!(art
@@ -684,6 +750,18 @@ mod tests {
         // between), then stop, spans, teardown.
         let life: Vec<&str> = seen.iter().map(String::as_str).filter(|c| *c != "cat /proc/meminfo").collect();
         assert_eq!(life, ["provision 2", "start", "steady", "load", "halt", "emit-spans", "teardown"]);
+    }
+
+    #[test]
+    fn execute_run_without_attribution_reports_none() {
+        // The default path is unchanged: no attribution session, no provenance,
+        // and every existing caller keeps working.
+        let sh = FakeShell::default();
+        let runner = FakeRunner::default();
+        let target = CommandTarget(CommandSet { commands: BTreeMap::new(), vars: BTreeMap::new() });
+        let workload = CommandWorkload(CommandSet { commands: BTreeMap::new(), vars: BTreeMap::new() });
+        let art = execute_run(&sh, &runner, &target, &workload, &[], None).unwrap();
+        assert!(art.vm_attribution.is_none());
     }
 
     #[test]

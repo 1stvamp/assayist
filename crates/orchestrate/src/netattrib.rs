@@ -15,9 +15,8 @@ use serde_json::{json, Value};
 
 /// Lifecycle states, matching the shared map ABI byte for byte. Fixed by the
 /// spec: sub-project 4's eBPF programs read this same value.
-/// Task 3's `state_name` consumes these; Task 5 wires the control client into
-/// the run driver, so they stay unreachable from `main` until then.
-#[allow(dead_code)]
+/// Task 3's `state_name` consumes these; the pause/resume states stay
+/// unreachable from `main` until sub-project 3's hook drives them.
 pub const LIFECYCLE_RUNNING: u8 = 0;
 #[allow(dead_code)]
 pub const LIFECYCLE_PAUSING: u8 = 1;
@@ -69,6 +68,21 @@ impl HandleTable {
         HandleTable::default()
     }
 
+    /// Reserve the next handle without recording provenance for it. The
+    /// counter always advances, so a reservation that is never (or not yet)
+    /// backed by an `insert` still burns that handle number rather than
+    /// letting a later, successful registration reuse it.
+    fn reserve(&mut self) -> u64 {
+        let handle = self.next;
+        self.next += 1;
+        handle
+    }
+
+    /// Record provenance for a handle already reserved via `reserve`.
+    fn insert(&mut self, provenance: VmProvenance) {
+        self.by_handle.insert(provenance.handle, provenance);
+    }
+
     #[allow(dead_code)]
     pub fn assign(
         &mut self,
@@ -78,19 +92,8 @@ impl HandleTable {
         ifindex: u32,
         netns_inum: u32,
     ) -> u64 {
-        let handle = self.next;
-        self.next += 1;
-        self.by_handle.insert(
-            handle,
-            VmProvenance {
-                handle,
-                vm_id,
-                tap,
-                guest_mac,
-                ifindex,
-                netns_inum,
-            },
-        );
+        let handle = self.reserve();
+        self.insert(VmProvenance { handle, vm_id, tap, guest_mac, ifindex, netns_inum });
         handle
     }
 
@@ -164,8 +167,6 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 /// The wire name for a lifecycle state byte, as the owner's protocol expects.
-/// Task 5 wires the control client into the run driver.
-#[allow(dead_code)]
 pub fn state_name(state: u8) -> &'static str {
     match state {
         LIFECYCLE_PAUSING => "PAUSING",
@@ -178,9 +179,7 @@ pub fn state_name(state: u8) -> &'static str {
 /// Request/reply client for the owner gadget's control socket. Every command
 /// waits for its reply, so a slow owner applies backpressure instead of the
 /// orchestrator dropping map updates on the floor.
-/// Task 5 wires this into the run driver.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ControlClient {
     reader: BufReader<UnixStream>,
 }
@@ -207,7 +206,6 @@ impl ControlClient {
         }
     }
 
-    #[allow(dead_code)]
     fn command(&mut self, line: &str) -> Result<(), String> {
         self.reader
             .get_mut()
@@ -226,19 +224,58 @@ impl ControlClient {
         }
     }
 
-    #[allow(dead_code)]
     pub fn add(&mut self, ifindex: u32, handle: u64, netns_inum: u32) -> Result<(), String> {
         self.command(&format!("add {ifindex} {handle} {netns_inum}"))
     }
 
-    #[allow(dead_code)]
     pub fn state(&mut self, handle: u64, state: u8) -> Result<(), String> {
         self.command(&format!("state {handle} {}", state_name(state)))
     }
 
-    #[allow(dead_code)]
     pub fn remove(&mut self, handle: u64) -> Result<(), String> {
         self.command(&format!("remove {handle}"))
+    }
+}
+
+/// One run's attribution state: the control channel to the owner gadget plus
+/// the handle table. Held by the run driver for the length of the run.
+pub struct AttributionSession {
+    pub client: ControlClient,
+    pub table: HandleTable,
+}
+
+impl AttributionSession {
+    /// Assign a handle to a VM and tell the owner about it. Returns the handle
+    /// the gadgets will emit in `labels.vm_id`. `guest_mac` is the MAC the
+    /// adapter actually configured on the device, recorded as provenance, not
+    /// derived here.
+    ///
+    /// The handle is reserved before the owner is told, but provenance is
+    /// only recorded once the owner accepts it: a rejected or failed `add`
+    /// must not leave a table entry for a VM the owner never learned about,
+    /// so a later `capture_meta.vm_attribution` cannot claim a registration
+    /// that did not happen. The handle number itself is still consumed on
+    /// failure, so it is never handed to a later, successful registration.
+    pub fn register(
+        &mut self,
+        vm_id: String,
+        tap: String,
+        guest_mac: String,
+        ifindex: u32,
+        netns_inum: u32,
+    ) -> Result<u64, String> {
+        let handle = self.table.reserve();
+        self.client.add(ifindex, handle, netns_inum)?;
+        self.table.insert(VmProvenance { handle, vm_id, tap, guest_mac, ifindex, netns_inum });
+        Ok(handle)
+    }
+
+    pub fn set_state(&mut self, handle: u64, state: u8) -> Result<(), String> {
+        self.client.state(handle, state)
+    }
+
+    pub fn deregister(&mut self, handle: u64) -> Result<(), String> {
+        self.client.remove(handle)
     }
 }
 
@@ -246,7 +283,7 @@ impl ControlClient {
 mod tests {
     use assayist_contract::Fragment;
     use serde_json::json;
-    use crate::netattrib::{guest_mac_for, rewrite_vm_id_labels, HandleTable};
+    use crate::netattrib::{guest_mac_for, rewrite_vm_id_labels, AttributionSession, HandleTable};
     use crate::netattrib::{
         state_name, ControlClient, LIFECYCLE_PAUSED, LIFECYCLE_PAUSING, LIFECYCLE_RESUMING,
         LIFECYCLE_RUNNING,
@@ -422,5 +459,51 @@ mod tests {
         let e = ControlClient::connect(&path, Duration::from_millis(200))
             .expect_err("no listener means connect fails");
         assert!(e.contains("control socket"), "got: {e}");
+    }
+
+    #[test]
+    fn session_assigns_and_rewrites_end_to_end() {
+        // The whole spine in miniature: a VM is assigned a handle, a gadget
+        // emits that handle in labels.vm_id, and assemble turns it into the
+        // ULID with provenance alongside.
+        let path = sock_path("session");
+        let owner = fake_owner(path.clone(), vec!["ok\n", "ok\n"]);
+        let client = ControlClient::connect(&path, Duration::from_secs(2)).expect("connect");
+        let mut session = AttributionSession { client, table: HandleTable::new() };
+
+        let handle = session
+            .register("01ULIDX".into(), "tap9".into(), "02:00:00:00:00:00".into(), 11, 0)
+            .expect("register sends add");
+        session.set_state(handle, LIFECYCLE_RUNNING).expect("state");
+
+        let mut frags = vec![frag_with_vm_id(&handle.to_string())];
+        let unknown = rewrite_vm_id_labels(&mut frags, &session.table);
+        assert!(unknown.is_empty());
+        assert_eq!(frags[0].series[0]["labels"]["vm_id"], "01ULIDX");
+        assert_eq!(session.table.provenance_json()[0]["tap"], "tap9");
+
+        let got = owner.join().expect("owner");
+        assert_eq!(got, vec!["add 11 0 0", "state 0 RUNNING"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn register_leaves_no_table_entry_when_the_owner_rejects_the_add() {
+        // A rejected add must not leave provenance for a VM the owner never
+        // actually recorded, or capture_meta.vm_attribution would claim a
+        // registration that did not happen.
+        let path = sock_path("register-err");
+        let owner = fake_owner(path.clone(), vec!["err no room\n"]);
+        let client = ControlClient::connect(&path, Duration::from_secs(2)).expect("connect");
+        let mut session = AttributionSession { client, table: HandleTable::new() };
+
+        let err = session
+            .register("01FAIL".into(), "tap0".into(), "02:00:00:00:00:00".into(), 11, 0)
+            .expect_err("owner rejected the add");
+        assert!(err.contains("no room"), "got: {err}");
+        assert_eq!(session.table.len(), 0);
+
+        let _ = owner.join();
+        let _ = std::fs::remove_file(&path);
     }
 }
