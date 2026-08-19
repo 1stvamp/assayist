@@ -142,7 +142,7 @@
         },
         "key_source": {
           "type": "string",
-          "enum": ["vcpu_pid_map", "cgroup_id", "guest_index", "device", "netdev"]
+          "enum": ["vcpu_pid_map", "cgroup_id", "guest_index", "device", "netdev", "vm_id"]
         },
         "max_keys": { "type": "integer", "minimum": 1 }
       },
@@ -169,6 +169,11 @@
           "description": "Probe id; MUST match a ProbeCost.probe_id when eBPF-sourced."
         },
         "key": { "type": "string" },
+        "labels": {
+          "type": "object",
+          "description": "Optional attribution dimensions a single key cannot carry (e.g. vm_id, lifecycle_state, backend). Values are scalars. The gate groups like-for-like by the label set and ignores unknown keys.",
+          "additionalProperties": { "$ref": "#/$defs/Scalar" }
+        },
         "cardinality_overflow": { "type": "boolean", "default": false },
         "cardinality": { "$ref": "#/$defs/CardinalityDecl" },
         "data": {

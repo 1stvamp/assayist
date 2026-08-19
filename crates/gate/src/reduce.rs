@@ -91,6 +91,34 @@ fn f64s(v: &Value) -> Vec<f64> {
         .unwrap_or_default()
 }
 
+/// Render a label value (a Scalar: string, number, integer, or boolean) as a
+/// plain string. Strings are used bare (no JSON quotes) so ids read cleanly.
+fn scalar_to_string(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Canonical, order-independent suffix for a series' labels, appended to the
+/// metric id so the gate matches series on (name, key, labels). Sorted by
+/// label key, so a producer may emit labels in any order and still join across
+/// runs. Empty or absent labels contribute nothing, leaving legacy ids intact.
+fn labels_suffix(labels: Option<&Value>) -> String {
+    let obj = match labels.and_then(|v| v.as_object()) {
+        Some(o) if !o.is_empty() => o,
+        _ => return String::new(),
+    };
+    let mut pairs: Vec<(&String, String)> =
+        obj.iter().map(|(k, v)| (k, scalar_to_string(v))).collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut s = String::new();
+    for (k, v) in pairs {
+        s.push_str(&format!("|{k}={v}"));
+    }
+    s
+}
+
 /// Set of probe ids that reported over_budget, whose sourced series are
 /// contaminated.
 fn overbudget_sources(run: &Value) -> HashSet<String> {
@@ -142,6 +170,7 @@ pub fn reduce(run: &Value) -> Vec<Metric> {
                 Some(k) => format!("{name}|{k}"),
                 None => name.to_string(),
             };
+            let base = format!("{base}{}", labels_suffix(s.get("labels")));
             let data = match s.get("data") {
                 Some(d) => d,
                 None => continue,
@@ -284,5 +313,65 @@ mod tests {
         // Latency in ns reads lower-better; nested iops reads higher-better.
         assert_eq!(m["workload:latency_p50_ns"].polarity, Polarity::LowerBetter);
         assert_eq!(m["workload:read.iops"].polarity, Polarity::HigherBetter);
+    }
+
+    #[test]
+    fn labels_qualify_the_metric_id() {
+        // Same name and key, different lifecycle_state -> distinct metric ids,
+        // so paused and running samples never collapse into one series.
+        let run = json!({
+            "series": [
+                {
+                    "name": "net.softirq_ns", "unit": "ns", "kind": "counter",
+                    "source": "softirq", "key": "vm7",
+                    "labels": { "lifecycle_state": "running", "backend": "tap" },
+                    "data": { "value": 100, "start_unix_nano": 0 }
+                },
+                {
+                    "name": "net.softirq_ns", "unit": "ns", "kind": "counter",
+                    "source": "softirq", "key": "vm7",
+                    "labels": { "lifecycle_state": "paused", "backend": "tap" },
+                    "data": { "value": 5, "start_unix_nano": 0 }
+                }
+            ]
+        });
+        let m: std::collections::HashMap<String, Metric> =
+            reduce(&run).into_iter().map(|x| (x.id.clone(), x)).collect();
+
+        // Label pairs are sorted by key: backend before lifecycle_state.
+        assert_eq!(m["net.softirq_ns|vm7|backend=tap|lifecycle_state=running|value"].value, 100.0);
+        assert_eq!(m["net.softirq_ns|vm7|backend=tap|lifecycle_state=paused|value"].value, 5.0);
+    }
+
+    #[test]
+    fn label_order_does_not_change_the_id() {
+        // Producer emits the same labels in two different orders; both reduce to
+        // the same id so they join across runs.
+        let a = json!({ "series": [{
+            "name": "net.drops", "unit": "1", "kind": "counter", "source": "kfree_skb",
+            "key": "vm1", "labels": { "backend": "tap", "lifecycle_state": "paused" },
+            "data": { "value": 3, "start_unix_nano": 0 }
+        }]});
+        let b = json!({ "series": [{
+            "name": "net.drops", "unit": "1", "kind": "counter", "source": "kfree_skb",
+            "key": "vm1", "labels": { "lifecycle_state": "paused", "backend": "tap" },
+            "data": { "value": 3, "start_unix_nano": 0 }
+        }]});
+        let id_a = reduce(&a).into_iter().find(|m| m.id.ends_with("|value")).unwrap().id;
+        let id_b = reduce(&b).into_iter().find(|m| m.id.ends_with("|value")).unwrap().id;
+        assert_eq!(id_a, id_b);
+    }
+
+    #[test]
+    fn no_labels_reduces_as_before() {
+        // Absence of labels leaves the id unchanged (name|key), so existing runs
+        // grade identically.
+        let run = json!({ "series": [{
+            "name": "block.io_bytes:read", "unit": "By", "kind": "counter",
+            "source": "block_rq_complete", "key": "254:0",
+            "data": { "value": 42, "start_unix_nano": 0 }
+        }]});
+        let ids: Vec<String> = reduce(&run).into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"block.io_bytes:read|254:0|value".to_string()));
     }
 }

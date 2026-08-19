@@ -407,4 +407,52 @@ mod tests {
         let cand = vec![counter_run("m", 100.0)];
         assert!(drift(&base, &cand, &cfg()).is_err());
     }
+
+    fn labelled_counter_run(name: &str, state: &str, val: f64) -> Value {
+        json!({"series": [{
+            "name": name, "kind": "counter", "unit": "", "source": "s",
+            "labels": { "lifecycle_state": state },
+            "data": {"value": val}
+        }]})
+    }
+
+    #[test]
+    fn ab_grades_label_variants_as_distinct_metrics() {
+        // Each run carries two series sharing a name but differing only by
+        // label (running vs paused). The gate must grade each label variant as
+        // its own metric and match like-for-like across A and B, not merge the
+        // two into one series.
+        let mk = |base: f64| -> Value {
+            json!({"series": [
+                {"name": "net.softirq_ns", "kind": "counter", "unit": "", "source": "s",
+                 "labels": {"lifecycle_state": "running"}, "data": {"value": base}},
+                {"name": "net.softirq_ns", "kind": "counter", "unit": "", "source": "s",
+                 "labels": {"lifecycle_state": "paused"}, "data": {"value": base / 20.0}},
+            ]})
+        };
+        let a: Vec<Value> = (0..3).map(|i| mk(100.0 + i as f64)).collect();
+        let b: Vec<Value> = (0..3).map(|i| mk(100.0 + i as f64)).collect();
+        let out = ab(&a, &b, &cfg()).unwrap();
+        let per = out["outcome"]["per_metric"].as_object().unwrap();
+        assert!(
+            per.contains_key("net.softirq_ns|lifecycle_state=running|value"),
+            "running variant graded as its own metric; got {:?}",
+            per.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            per.contains_key("net.softirq_ns|lifecycle_state=paused|value"),
+            "paused variant graded as its own metric; got {:?}",
+            per.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ab_does_not_compare_across_differing_labels() {
+        // Same series name, but A is all running and B is all paused. Different
+        // labels give different metric ids, so the two are disjoint and nothing
+        // is comparable: a gate error, not a hollow pass over a false match.
+        let a: Vec<Value> = (0..3).map(|_| labelled_counter_run("m", "running", 1.0)).collect();
+        let b: Vec<Value> = (0..3).map(|_| labelled_counter_run("m", "paused", 1.0)).collect();
+        assert!(ab(&a, &b, &cfg()).is_err());
+    }
 }
