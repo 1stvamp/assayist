@@ -16,6 +16,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -40,9 +41,14 @@ pub struct VmCtx {
     pub _pad: [u8; 3],
 }
 
+/// Width of the map value on the wire. Derived from the struct rather than
+/// written out, so a layout change is a compile error here and in `create`'s
+/// `value_size` instead of a runtime size mismatch against the kernel.
+const VM_CTX_BYTES: usize = std::mem::size_of::<VmCtx>();
+
 impl VmCtx {
-    fn as_bytes(&self) -> [u8; 16] {
-        let mut b = [0u8; 16];
+    fn as_bytes(&self) -> [u8; VM_CTX_BYTES] {
+        let mut b = [0u8; VM_CTX_BYTES];
         b[0..8].copy_from_slice(&self.vm_id.to_ne_bytes());
         b[8..12].copy_from_slice(&self.netns_inum.to_ne_bytes());
         b[12] = self.lifecycle_state;
@@ -174,13 +180,21 @@ fn create_and_pin(pin: &str, max_vms: u32) -> Result<MapHandle> {
     if let Some(dir) = Path::new(pin).parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    // `sz` is libbpf's opts-struct versioning field, and its userspace
+    // OPTS_VALID check rejects a zero one before any syscall is made, so a
+    // `Default::default()` here fails every run with "bpf_map_create_opts size
+    // (0) is too small". Every other field stays at its default.
+    let opts = libbpf_sys::bpf_map_create_opts {
+        sz: std::mem::size_of::<libbpf_sys::bpf_map_create_opts>() as libbpf_sys::size_t,
+        ..Default::default()
+    };
     let mut map = MapHandle::create(
         MapType::Hash,
         Some("vm_by_ifindex"),
         std::mem::size_of::<u32>() as u32,
         std::mem::size_of::<VmCtx>() as u32,
         max_vms,
-        &Default::default(),
+        &opts,
     )
     .context("creating vm_by_ifindex")?;
     map.pin(pin).with_context(|| format!("pinning at {pin}"))?;
@@ -238,6 +252,26 @@ fn apply(map: &MapHandle, cmd: &Command, stats: &mut Stats) -> Result<()> {
     Ok(())
 }
 
+/// Set by the SIGTERM/SIGINT handler. Checked by the serve loop so a ctrl-C or
+/// a harness kill leaves through the normal cleanup path.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Handle SIGTERM/SIGINT rather than dying on them: the default disposition
+/// would leave the pin and the control socket behind, and the stale-pin policy
+/// then hard-fails every later run until someone removes the pin by hand. A
+/// relaxed store is all the handler does, which is async-signal-safe.
+fn install_signal_handlers() {
+    unsafe {
+        let h = on_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGINT, h);
+    }
+}
+
 /// Serve control commands until the window closes. One reply line per command,
 /// so a slow owner applies backpressure rather than dropping updates. The
 /// listener is non-blocking and polled, because the window is what ends the run,
@@ -245,12 +279,17 @@ fn apply(map: &MapHandle, cmd: &Command, stats: &mut Stats) -> Result<()> {
 fn serve(listener: &UnixListener, map: &MapHandle, stats: &mut Stats, deadline: Instant) {
     listener.set_nonblocking(true).ok();
     let mut peers: Vec<BufReader<UnixStream>> = Vec::new();
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !SHUTDOWN.load(Ordering::SeqCst) {
+        // Only an idle iteration sleeps. Sleeping unconditionally put a ~10ms
+        // floor under every request/reply command, on the critical path between
+        // steady and the signal gadgets attaching.
+        let mut worked = false;
         match listener.accept() {
             Ok((s, _)) => {
                 s.set_nonblocking(false).ok();
                 s.set_read_timeout(Some(Duration::from_millis(50))).ok();
                 peers.push(BufReader::new(s));
+                worked = true;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {}
@@ -275,17 +314,21 @@ fn serve(listener: &UnixListener, map: &MapHandle, stats: &mut Stats, deadline: 
                     };
                     let _ = p.get_mut().write_all(reply.as_bytes());
                     let _ = p.get_mut().flush();
+                    worked = true;
                 }
                 Err(_) => continue,
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
+        if !worked {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    install_signal_handlers();
     let mut map = create_and_pin(&args.attrib_map, args.max_vms)?;
     let _ = std::fs::remove_file(&args.control);
     let listener = match UnixListener::bind(&args.control)
@@ -307,7 +350,9 @@ fn main() -> Result<()> {
     let window_ns = start.elapsed().as_nanos() as u64;
 
     // Release the pin and the socket: the next run creates its own, and a left
-    // pin would make that run fail with the stale-pin error.
+    // pin would make that run fail with the stale-pin error. A SIGTERM/SIGINT
+    // shutdown falls through here too, so a ctrl-C still writes the fragment for
+    // the window it did serve.
     let _ = map.unpin(&args.attrib_map);
     let _ = std::fs::remove_file(&args.control);
 
@@ -328,9 +373,15 @@ mod tests {
     fn vm_ctx_layout_matches_the_shared_abi() {
         // Fixed by the spec: u64 + u32 + u8 + 3 pad = 16 bytes, 8-aligned.
         // Sub-project 4's eBPF programs declare the same struct, so a silent
-        // layout change here would silently corrupt their reads.
+        // layout change here would silently corrupt their reads. Size and
+        // alignment alone would not catch it: swapping netns_inum with
+        // lifecycle_state plus its padding keeps both.
         assert_eq!(std::mem::size_of::<VmCtx>(), 16);
         assert_eq!(std::mem::align_of::<VmCtx>(), 8);
+        assert_eq!(std::mem::offset_of!(VmCtx, vm_id), 0);
+        assert_eq!(std::mem::offset_of!(VmCtx, netns_inum), 8);
+        assert_eq!(std::mem::offset_of!(VmCtx, lifecycle_state), 12);
+        assert_eq!(std::mem::offset_of!(VmCtx, _pad), 13);
     }
 
     #[test]
@@ -390,5 +441,53 @@ mod tests {
         assert_eq!(m["commands"]["state"], 6);
         assert_eq!(m["commands"]["remove"], 2);
         assert_eq!(m["command_errors"], 1);
+    }
+
+    /// The real map, end to end: create, pin, apply each command, check the
+    /// bytes the signal gadgets will read, unpin. This is the coverage a pure
+    /// unit suite cannot give, because `MapHandle::create` validates its opts in
+    /// userspace and then makes a syscall, and both can fail on their own.
+    ///
+    /// Needs root (CAP_BPF/CAP_SYS_ADMIN) and a mounted bpffs, so it is ignored
+    /// by default. Run it with:
+    ///   sudo -E cargo test --manifest-path capture/netattrib/Cargo.toml -- --ignored
+    #[test]
+    #[ignore = "needs root and a mounted bpffs"]
+    fn create_pin_apply_and_unpin_against_a_real_map() {
+        let dir = format!("/sys/fs/bpf/assayist-test-{}", std::process::id());
+        let pin = format!("{dir}/vm_by_ifindex");
+        let mut map = create_and_pin(&pin, 16).expect("create and pin");
+        assert!(Path::new(&pin).exists(), "the pin must exist after create_and_pin");
+
+        let mut stats = Stats::default();
+        apply(&map, &Command::Add { ifindex: 11, handle: 3, netns_inum: 4026531840 }, &mut stats)
+            .expect("add");
+        let key = 11u32.to_ne_bytes();
+        let got = map.lookup(&key, MapFlags::ANY).expect("lookup").expect("entry present");
+        assert_eq!(
+            got,
+            VmCtx {
+                vm_id: 3,
+                netns_inum: 4026531840,
+                lifecycle_state: LIFECYCLE_RUNNING,
+                _pad: [0; 3],
+            }
+            .as_bytes()
+        );
+
+        apply(&map, &Command::State { handle: 3, state: LIFECYCLE_PAUSED }, &mut stats)
+            .expect("state");
+        let got = map.lookup(&key, MapFlags::ANY).expect("lookup").expect("entry present");
+        assert_eq!(VmCtx::from_bytes(&got).lifecycle_state, LIFECYCLE_PAUSED);
+        assert_eq!(VmCtx::from_bytes(&got).vm_id, 3, "state must not disturb the handle");
+
+        apply(&map, &Command::Remove { handle: 3 }, &mut stats).expect("remove");
+        assert!(map.lookup(&key, MapFlags::ANY).expect("lookup").is_none());
+        assert_eq!((stats.adds, stats.states, stats.removes), (1, 1, 1));
+        assert_eq!((stats.peak_live, stats.final_live), (1, 0));
+
+        map.unpin(&pin).expect("unpin");
+        assert!(!Path::new(&pin).exists(), "unpin must remove the pin");
+        let _ = std::fs::remove_dir(&dir);
     }
 }

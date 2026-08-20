@@ -40,14 +40,24 @@ pub struct VmProvenance {
     pub netns_inum: u32,
 }
 
-/// A locally administered MAC derived from the handle, so it is deterministic
-/// per run and cannot collide between concurrent instances. The `02:` prefix
-/// marks the address as locally administered.
+/// A locally administered MAC derived from the per-instance index, so it is
+/// deterministic per run and unique across the concurrent instances on a host
+/// (the index is what distinguishes them). The `02:` prefix marks the address as
+/// locally administered.
+///
+/// The index and not the handle, though the spec said handle: the MAC has to be
+/// configured during `provision`, and the handle does not exist until the VM is
+/// registered after steady, so the handle is genuinely unavailable at that
+/// point.
+///
+/// Only the low 16 bits of the index reach the address, so an index above 65535
+/// collides silently. The owner's own ceiling (`--max-vms`, 1024 by default) is
+/// far below that.
 /// Tasks 3 and 4 consume this.
 #[allow(dead_code)]
-pub fn guest_mac_for(handle: u64) -> String {
-    let hi = ((handle >> 8) & 0xff) as u8;
-    let lo = (handle & 0xff) as u8;
+pub fn guest_mac_for(index: u64) -> String {
+    let hi = ((index >> 8) & 0xff) as u8;
+    let lo = (index & 0xff) as u8;
     format!("02:00:00:00:{hi:02x}:{lo:02x}")
 }
 
@@ -139,6 +149,10 @@ impl HandleTable {
 /// emit to the ULID the run reports. Returns the handle strings with no table
 /// entry, in first-seen order: a handle the orchestrator never issued means a
 /// stale map, so it is surfaced rather than dropped or invented.
+///
+/// Only `series` are rewritten, not `self_metrics`: those carry probe costs
+/// (`ProbeCost` per eBPF program), which are per-gadget and never per-VM, so
+/// they have no `vm_id` label to translate.
 /// Tasks 3 and 4 consume this.
 #[allow(dead_code)]
 pub fn rewrite_vm_id_labels(fragments: &mut [Fragment], table: &HandleTable) -> Vec<String> {
@@ -149,7 +163,14 @@ pub fn rewrite_vm_id_labels(fragments: &mut [Fragment], table: &HandleTable) -> 
                 Some(r) => r.to_string(),
                 None => continue,
             };
-            match raw.parse::<u64>().ok().and_then(|h| table.get(h)) {
+            // A value that is not a handle at all (an already-rewritten ULID,
+            // say) is left alone and not flagged: the unresolved signal means
+            // "stale map", so a second rewrite pass must not raise it.
+            let handle = match raw.parse::<u64>() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            match table.get(handle) {
                 Some(p) => s["labels"]["vm_id"] = json!(p.vm_id),
                 None => {
                     if !unknown.contains(&raw) {
@@ -182,6 +203,11 @@ pub fn state_name(state: u8) -> &'static str {
 #[derive(Debug)]
 pub struct ControlClient {
     reader: BufReader<UnixStream>,
+    /// Set on any I/O error mid-command. The reply to the failed command may
+    /// still be sitting in the stream, so a later command would read the
+    /// previous answer and every result after it would be wrong. A
+    /// desynchronised channel fails loudly instead.
+    poisoned: bool,
 }
 
 impl ControlClient {
@@ -194,7 +220,7 @@ impl ControlClient {
             match UnixStream::connect(path) {
                 Ok(s) => {
                     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    return Ok(ControlClient { reader: BufReader::new(s) });
+                    return Ok(ControlClient { reader: BufReader::new(s), poisoned: false });
                 }
                 Err(e) => {
                     if Instant::now() >= deadline {
@@ -207,15 +233,24 @@ impl ControlClient {
     }
 
     fn command(&mut self, line: &str) -> Result<(), String> {
-        self.reader
-            .get_mut()
-            .write_all(format!("{line}\n").as_bytes())
-            .map_err(|e| format!("sending '{line}': {e}"))?;
-        self.reader.get_mut().flush().map_err(|e| format!("flushing '{line}': {e}"))?;
+        if self.poisoned {
+            return Err(format!(
+                "attribution control channel is desynchronised after an earlier I/O error, refusing '{line}'"
+            ));
+        }
+        if let Err(e) = self.reader.get_mut().write_all(format!("{line}\n").as_bytes()) {
+            self.poisoned = true;
+            return Err(format!("sending '{line}': {e}"));
+        }
+        if let Err(e) = self.reader.get_mut().flush() {
+            self.poisoned = true;
+            return Err(format!("flushing '{line}': {e}"));
+        }
         let mut reply = String::new();
-        self.reader
-            .read_line(&mut reply)
-            .map_err(|e| format!("reading reply to '{line}': {e}"))?;
+        if let Err(e) = self.reader.read_line(&mut reply) {
+            self.poisoned = true;
+            return Err(format!("reading reply to '{line}': {e}"));
+        }
         let reply = reply.trim();
         match reply.strip_prefix("err") {
             Some(msg) => Err(format!("attribution owner rejected '{line}':{msg}")),
@@ -279,11 +314,46 @@ impl AttributionSession {
     }
 }
 
+/// A fake owner: accepts one connection, replies to each line from `replies`
+/// in order, and records what it received. Returns the recording handle. Shared
+/// with the adapter's tests, which drive a whole run against it.
+#[cfg(test)]
+pub fn fake_owner(path: String, replies: Vec<&'static str>) -> std::thread::JoinHandle<Vec<String>> {
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(&path).expect("bind fake owner");
+    std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let (s, _) = listener.accept().expect("accept");
+        let mut r = BufReader::new(s);
+        for reply in replies {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            got.push(line.trim().to_string());
+            let _ = r.get_mut().write_all(reply.as_bytes());
+            let _ = r.get_mut().flush();
+        }
+        got
+    })
+}
+
+/// A per-test socket path in the temp dir, cleared first so a previous run's
+/// leftover cannot make `bind` fail.
+#[cfg(test)]
+pub fn sock_path(name: &str) -> String {
+    let p = std::env::temp_dir().join(format!("assayist-test-{}-{}.sock", name, std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p.to_string_lossy().into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use assayist_contract::Fragment;
     use serde_json::json;
-    use crate::netattrib::{guest_mac_for, rewrite_vm_id_labels, AttributionSession, HandleTable};
+    use crate::netattrib::{
+        fake_owner, guest_mac_for, rewrite_vm_id_labels, sock_path, AttributionSession, HandleTable,
+    };
     use crate::netattrib::{
         state_name, ControlClient, LIFECYCLE_PAUSED, LIFECYCLE_PAUSING, LIFECYCLE_RESUMING,
         LIFECYCLE_RUNNING,
@@ -316,9 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn guest_mac_is_locally_administered_and_derived_from_the_handle() {
+    fn guest_mac_is_locally_administered_and_derived_from_the_instance_index() {
         // 02: prefix marks a locally administered address; the low 16 bits of
-        // the handle fill the last two octets.
+        // the instance index fill the last two octets. The index, not the
+        // handle: the MAC is configured at provision, before any handle exists.
         assert_eq!(guest_mac_for(0), "02:00:00:00:00:00");
         assert_eq!(guest_mac_for(1), "02:00:00:00:00:01");
         assert_eq!(guest_mac_for(258), "02:00:00:00:01:02");
@@ -369,6 +440,20 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_leaves_a_non_numeric_vm_id_alone_without_flagging_it() {
+        // An already-rewritten ULID is not a handle, so a second pass must
+        // neither touch it nor report it: unresolved_handles means "stale map",
+        // and a double rewrite is not that.
+        let mut t = HandleTable::new();
+        let h = t.assign("01ULID".into(), "tap0".into(), "02:00:00:00:00:01".into(), 11, 40);
+        let mut frags = vec![frag_with_vm_id(&h.to_string())];
+        assert!(rewrite_vm_id_labels(&mut frags, &t).is_empty());
+        let twice = rewrite_vm_id_labels(&mut frags, &t);
+        assert!(twice.is_empty(), "a second rewrite must not flag the ULID, got {twice:?}");
+        assert_eq!(frags[0].series[0]["labels"]["vm_id"], "01ULID");
+    }
+
+    #[test]
     fn rewrite_ignores_series_without_a_vm_id_label() {
         let mut t = HandleTable::new();
         t.assign("01ULID".into(), "tap0".into(), "02:00:00:00:00:01".into(), 11, 40);
@@ -387,36 +472,8 @@ mod tests {
         assert!(frags[0].series[0].get("labels").is_none());
     }
 
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::io::BufReader;
     use std::time::Duration;
-
-    /// A fake owner: accepts one connection, replies to each line from `replies`
-    /// in order, and records what it received. Returns the recording handle.
-    fn fake_owner(path: String, replies: Vec<&'static str>) -> std::thread::JoinHandle<Vec<String>> {
-        let listener = UnixListener::bind(&path).expect("bind fake owner");
-        std::thread::spawn(move || {
-            let mut got = Vec::new();
-            let (s, _) = listener.accept().expect("accept");
-            let mut r = BufReader::new(s);
-            for reply in replies {
-                let mut line = String::new();
-                if r.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                got.push(line.trim().to_string());
-                let _ = r.get_mut().write_all(reply.as_bytes());
-                let _ = r.get_mut().flush();
-            }
-            got
-        })
-    }
-
-    fn sock_path(name: &str) -> String {
-        let p = std::env::temp_dir().join(format!("assayist-test-{}-{}.sock", name, std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        p.to_string_lossy().into_owned()
-    }
 
     #[test]
     fn state_names_match_the_wire_protocol() {
@@ -449,6 +506,33 @@ mod tests {
         let mut c = ControlClient::connect(&path, Duration::from_secs(2)).expect("connect");
         let e = c.remove(5).expect_err("err reply must be an error");
         assert!(e.contains("no entry for handle 5"), "got: {e}");
+        let _ = owner.join();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn client_poisons_itself_after_an_io_error() {
+        // The reply to the failed command may still arrive later, so the stream
+        // is out of step: without poisoning, the next command would read this
+        // command's answer and every result after it would be wrong.
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let path = sock_path("poison");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let owner = std::thread::spawn(move || {
+            // Accepts and never replies, so the client's read times out.
+            let (s, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(300));
+            drop(s);
+        });
+
+        let s = UnixStream::connect(&path).expect("connect");
+        s.set_read_timeout(Some(Duration::from_millis(50))).expect("read timeout");
+        let mut c = ControlClient { reader: BufReader::new(s), poisoned: false };
+        let first = c.add(11, 0, 0).expect_err("the read must time out");
+        assert!(first.contains("reading reply"), "got: {first}");
+        let second = c.remove(0).expect_err("a desynchronised channel must fail loudly");
+        assert!(second.contains("desynchronised"), "got: {second}");
+
         let _ = owner.join();
         let _ = std::fs::remove_file(&path);
     }

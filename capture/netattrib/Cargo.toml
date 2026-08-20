@@ -27,3 +27,6 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 libbpf-rs = "0.24"
 libbpf-sys = "1.4"
+# Only for the SIGTERM/SIGINT handler that unpins on the way out. The core
+# crates stay dependency-free of this; it is scoped to this gadget.
+libc = "0.2"

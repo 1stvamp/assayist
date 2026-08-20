@@ -51,6 +51,22 @@ fn cfg(
     }
 }
 
+/// Lower-case base36 of `n`. Used to fit a whole pid into a kernel interface
+/// name, which is capped at 15 characters.
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
 fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -203,10 +219,19 @@ pub fn firecracker_target(
     let stream_dir = format!("{}.stream.{}", sock, now_nanos());
 
     // Tap networking is opt-in. The instance index (already used for the API
-    // socket) keeps tap names and MACs unique across concurrent instances.
+    // socket) keeps tap names and MACs unique across concurrent instances, and
+    // the name carries the whole pid, base36 to fit the kernel's 15-character
+    // interface-name limit ("asy" + 7 + "-" + the index). A truncated pid
+    // (`pid % 100000`) collided between two orchestrators whose pids differed by
+    // exactly that, and provision's guard-delete would then have taken out a
+    // live VM's tap; pids are unique among live processes, so the full one
+    // cannot.
+    //
+    // The MAC comes from the index, not the handle: it has to be configured
+    // during provision, and no handle exists until registration after steady.
     let instance: u64 = vars.get("instance").and_then(|s| s.parse().ok()).unwrap_or(0);
     let tap = matches!(g("network", "").to_lowercase().as_str(), "tap")
-        .then(|| format!("asy{}-{}", std::process::id() % 100000, instance));
+        .then(|| format!("asy{}-{}", base36(std::process::id() as u64), instance));
     let guest_mac = crate::netattrib::guest_mac_for(instance);
 
     FirecrackerTarget {
@@ -457,6 +482,12 @@ impl Target for FirecrackerTarget {
         // Tap networking, when asked for. Created before the API call that
         // names it, because Firecracker validates the device exists. The
         // ifindex comes from sysfs rather than parsing `ip` output.
+        //
+        // The leading `del` deliberately reclaims a stale tap left by a crashed
+        // run, which is the opposite of the owner gadget's stale-pin stance and
+        // is right for a tap: the name is ours (full pid plus instance index),
+        // the device carries no state worth surfacing, and a live process cannot
+        // hold that pid, so no running VM's tap is at risk.
         if let Some(tap) = &self.tap {
             sh.run(&format!(
                 "ip tuntap del dev '{tap}' mode tap 2>/dev/null; \
@@ -570,16 +601,21 @@ impl Target for FirecrackerTarget {
         self.pinning.borrow().clone()
     }
 
-    fn net_attribution(&self, _sh: &dyn Shell) -> Option<NetAttribution> {
-        let tap = self.tap.clone()?;
-        Some(NetAttribution {
+    fn net_attribution(&self, _sh: &dyn Shell) -> Vec<NetAttribution> {
+        // One VM, so at most one row. Empty until provision has both created the
+        // tap and read its ifindex.
+        let (Some(tap), Some(ifindex)) = (self.tap.clone(), *self.tap_ifindex.borrow()) else {
+            return Vec::new();
+        };
+        vec![NetAttribution {
             tap,
-            ifindex: (*self.tap_ifindex.borrow())?,
+            ifindex,
             guest_mac: self.guest_mac.clone(),
             // Host netns. Per-VM netns is not used: the tap lives in the host
-            // namespace, and netns is recorded for cross-check only.
+            // namespace, and netns is recorded for cross-check only (see the
+            // map ABI section of capture/netattrib/README.md).
             netns_inum: 0,
-        })
+        }]
     }
 
 
@@ -2012,7 +2048,7 @@ mod tests {
         target.provision(&sh).unwrap();
         assert!(!sh.saw("/network-interfaces"));
         assert!(!sh.saw("ip tuntap add"));
-        assert!(target.net_attribution(&sh).is_none());
+        assert!(target.net_attribution(&sh).is_empty());
     }
 
     #[test]
@@ -2033,9 +2069,27 @@ mod tests {
         assert!(sh.saw("host_dev_name"));
         assert!(sh.saw("02:00:00:00:00:02"), "guest mac derives from the instance");
 
-        let attrib = target.net_attribution(&sh).expect("tap networking reports attribution");
+        let reported = target.net_attribution(&sh);
+        assert_eq!(reported.len(), 1, "one VM reports one tap");
+        let attrib = &reported[0];
         assert_eq!(attrib.guest_mac, "02:00:00:00:00:02");
-        assert!(attrib.tap.contains('2'), "tap name carries the instance: {}", attrib.tap);
+        assert!(attrib.tap.ends_with("-2"), "tap name carries the instance: {}", attrib.tap);
+        assert!(
+            attrib.tap.len() <= 15,
+            "tap name must fit the kernel's 15-character interface-name limit: {} ({} chars)",
+            attrib.tap,
+            attrib.tap.len()
+        );
+    }
+
+    #[test]
+    fn base36_encodes_the_pid_compactly() {
+        // The whole pid has to fit an interface name, so it is base36: a u32 pid
+        // is at most 7 characters, leaving room for "asy" and the instance index.
+        assert_eq!(base36(0), "0");
+        assert_eq!(base36(35), "z");
+        assert_eq!(base36(36), "10");
+        assert_eq!(base36(u32::MAX as u64).len(), 7);
     }
 
     #[test]

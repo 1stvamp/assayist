@@ -100,7 +100,7 @@ the template vars in the last section.
 | `snapshot_out` | | Create a steady-state snapshot mid-run at this path; needs `snapshot_mem`. |
 | `snapshot_mem` | | Memory-file path for `snapshot_out`. |
 | `readiness` | | Shell command that must succeed for the guest to count as ready. |
-| `network` | (unset) | `tap` to give the VM a host tap device (created on provision, deleted on teardown) and a deterministic locally-administered MAC. Absent means no network interface, the historical behaviour. Required for per-VM network attribution. |
+| `network` | (unset) | `tap` to give the VM a host tap device (created on provision, deleted on teardown) and a deterministic locally-administered MAC. Absent means no network interface, the historical behaviour. Required for per-VM network attribution. Cold boot only: a def that restores `from_snapshot` never reaches the tap setup, so the key has no effect there. |
 
 ### `qemu`
 

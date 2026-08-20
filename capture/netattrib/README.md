@@ -46,6 +46,12 @@ Fixed, and shared with the signal gadgets:
 orchestrator holds the handle to ULID table and rewrites the label when the run
 is assembled.
 
+`netns_inum` is the inode of the network namespace the device lives in. The
+orchestrator's firecracker adapter always sends `0`: the tap is created in the
+host namespace, not a per-VM one, so the field is there for a cross-check by the
+signal gadgets rather than as a lookup key. A future adapter that does put the
+tap in its own namespace fills it in without a map change.
+
 Lifecycle states: `0` RUNNING, `1` PAUSING, `2` PAUSED, `3` RESUMING.
 
 ## Control protocol
@@ -79,4 +85,7 @@ command counts, and `command_errors`.
 - An existing pin is an error, never reclaimed. Clear a stale pin by hand
   (`rm /sys/fs/bpf/assayist/vm_by_ifindex`) so a crashed prior run cannot
   silently contaminate this one.
+- SIGTERM and SIGINT end the window early and still unpin and remove the socket,
+  so a ctrl-C or a harness kill does not leave a pin that hard-fails every later
+  run. A SIGKILL or a hard crash does, and needs the manual `rm` above.
 - Needs `CAP_BPF`/`CAP_SYS_ADMIN` to create and pin a map, and a mounted bpffs.

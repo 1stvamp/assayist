@@ -85,14 +85,16 @@ pub trait Target {
     fn resident_files(&self) -> Vec<(String, String)> {
         Vec::new()
     }
-    /// The tap identity this target set up, if it did. The run driver uses it to
-    /// assign a handle and drive the attribution map. Defaulted to `None` so
-    /// every existing target is unaffected: the adapter stays free of BPF and
-    /// sockets, and only a target that actually creates a tap reports one.
+    /// The tap identities this target set up, one per VM it brought up, in the
+    /// order it created them. The run driver registers each and drives the
+    /// attribution map for all of them. Empty means no tap, which is the default
+    /// so every existing target is unaffected: the adapter stays free of BPF and
+    /// sockets, and only a target that actually creates taps reports any. A
+    /// fanout reports N, one per inner instance.
     /// Task 5 calls this from the run driver.
     #[allow(dead_code)]
-    fn net_attribution(&self, _sh: &dyn Shell) -> Option<NetAttribution> {
-        None
+    fn net_attribution(&self, _sh: &dyn Shell) -> Vec<NetAttribution> {
+        Vec::new()
     }
 }
 
@@ -326,6 +328,13 @@ impl Target for FanoutTarget {
     }
 
 
+    fn net_attribution(&self, sh: &dyn Shell) -> Vec<NetAttribution> {
+        // Every inner instance owns its own tap, so a fanout reports all of
+        // them, in inner order. Without this the fanout took the empty default
+        // and an N-VM run had nothing attributed at all.
+        self.inners.iter().flat_map(|t| t.net_attribution(sh)).collect()
+    }
+
     fn resident_files(&self) -> Vec<(String, String)> {
         // Key each instance's mem file by its index, so N sandboxes restored
         // from one snapshot get per-guest residency (the file is shared through
@@ -495,43 +504,53 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
     target.reach_steady(sh)?;
     let mem_after = sample_meminfo(sh);
 
-    // Attribution, when enabled and the target actually set up a tap. Register
-    // after steady so the tap exists and its ifindex is known, and before the
+    // Attribution, when enabled and the target actually set up taps. Register
+    // after steady so each tap exists and its ifindex is known, and before the
     // gadgets attach so their first samples are already attributable. Only the
-    // handle (not the session borrow) is carried across the gadget spawn/wait
+    // handles (not the session borrow) are carried across the gadget spawn/wait
     // below; the session is re-borrowed afterwards to deregister and rewrite.
-    let mut attributed_handle: Option<u64> = None;
+    let mut attributed: Vec<u64> = Vec::new();
     if let Some(session) = attrib.as_deref_mut() {
-        match target.net_attribution(sh) {
-            Some(na) => {
-                let handle = match session.register(
-                    crate::run::new_run_id(),
-                    na.tap,
-                    na.guest_mac,
-                    na.ifindex,
-                    na.netns_inum,
-                ) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        let _ = target.teardown(sh);
-                        return Err(e);
+        let vms = target.net_attribution(sh);
+        if vms.is_empty() {
+            // A run that asked for attribution but whose target set up no tap
+            // is a config error, not a silent no-op: every later network sample
+            // would be unattributable.
+            let _ = target.teardown(sh);
+            return Err(
+                "attribution enabled but the target set up no tap (note: tap networking is cold boot only, so a snapshot-restore def will not have one even with the key set); set `network: tap` on a cold-boot target"
+                    .to_string(),
+            );
+        }
+        for na in vms {
+            // Each VM gets its own ULID; the handle is the dense id the map and
+            // the raw fragments carry.
+            let handle = match session.register(
+                crate::run::new_run_id(),
+                na.tap,
+                na.guest_mac,
+                na.ifindex,
+                na.netns_inum,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    for h in &attributed {
+                        let _ = session.deregister(*h);
                     }
-                };
-                if let Err(e) = session.set_state(handle, crate::netattrib::LIFECYCLE_RUNNING) {
                     let _ = target.teardown(sh);
                     return Err(e);
                 }
-                attributed_handle = Some(handle);
-            }
-            None => {
-                // A run that asked for attribution but whose target set up no
-                // tap is a config error, not a silent no-op: every later
-                // network sample would be unattributable.
+            };
+            // Recorded before the state command, so a failing `set_state` still
+            // removes the entry its `add` just created rather than leaving it
+            // for the owner to hold until the window closes.
+            attributed.push(handle);
+            if let Err(e) = session.set_state(handle, crate::netattrib::LIFECYCLE_RUNNING) {
+                for h in &attributed {
+                    let _ = session.deregister(*h);
+                }
                 let _ = target.teardown(sh);
-                return Err(
-                    "attribution enabled but the target reports no tap; set `network: tap` on the target"
-                        .to_string(),
-                );
+                return Err(e);
             }
         }
     }
@@ -541,6 +560,7 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
         match runner.spawn(inv) {
             Ok(h) => handles.push(h),
             Err(e) => {
+                deregister_all(&mut attrib, &attributed);
                 let _ = target.teardown(sh);
                 return Err(e);
             }
@@ -548,6 +568,7 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
     }
 
     if let Err(e) = workload.start(sh) {
+        deregister_all(&mut attrib, &attributed);
         let _ = target.teardown(sh);
         return Err(e);
     }
@@ -558,6 +579,7 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
             Ok(f) => fragments.push(f),
             Err(e) => {
                 let _ = workload.stop(sh);
+                deregister_all(&mut attrib, &attributed);
                 let _ = target.teardown(sh);
                 return Err(e);
             }
@@ -577,16 +599,22 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
         .filter_map(|(label, path)| sample_residency(&path).map(|(r, t)| (label, r, t)))
         .collect();
 
-    target.teardown(sh)?;
+    // Deregister before teardown deletes the taps, which is the spec's order
+    // ("remove <handle>, delete tap") and matters: ifindex is a recycled kernel
+    // resource, so an entry left in the map while its tap goes away is keyed on
+    // an index the kernel can hand to a later tap. Teardown's result is held
+    // rather than propagated with `?` so the label rewrite and the provenance
+    // below happen on the same path whether teardown succeeded or not.
+    deregister_all(&mut attrib, &attributed);
+    let teardown = target.teardown(sh);
 
     fragments.push(hostmem_fragment(mem_before, mem_after));
     if let Some(f) = resident_fragment(&resident) {
         fragments.push(f);
     }
 
-    let vm_attribution = match (attributed_handle, attrib) {
-        (Some(handle), Some(session)) => {
-            let _ = session.deregister(handle);
+    let vm_attribution = match attrib {
+        Some(session) if !attributed.is_empty() => {
             let unknown = crate::netattrib::rewrite_vm_id_labels(&mut fragments, &session.table);
             let mut prov = json!({ "vms": session.table.provenance_json() });
             if !unknown.is_empty() {
@@ -598,7 +626,22 @@ pub fn execute_run<S: Shell, R: GadgetRunner>(
         _ => None,
     };
 
+    teardown?;
     Ok(RunArtifacts { fragments, spans, workload_report, vm_attribution })
+}
+
+/// Remove every handle this run registered from the owner's map. Best-effort:
+/// an abort path already has a failure to report, and a leaked entry keyed on a
+/// recyclable ifindex is worse than a dropped error message.
+fn deregister_all(
+    attrib: &mut Option<&mut crate::netattrib::AttributionSession>,
+    handles: &[u64],
+) {
+    if let Some(session) = attrib.as_deref_mut() {
+        for h in handles {
+            let _ = session.deregister(*h);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -838,6 +881,132 @@ mod tests {
         fn resident_files(&self) -> Vec<(String, String)> {
             self.0.clone()
         }
+    }
+
+    /// A target that reports one tap and nothing else, for the fanout
+    /// attribution test.
+    struct TapStub(NetAttribution);
+    impl Target for TapStub {
+        fn version(&self, _: &dyn Shell) -> String {
+            "tapstub".into()
+        }
+        fn provision(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn start(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn reach_steady(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn spans(&self, _: &dyn Shell) -> Result<Vec<Value>, String> {
+            Ok(vec![])
+        }
+        fn teardown(&self, _: &dyn Shell) -> Result<(), String> {
+            Ok(())
+        }
+        fn net_attribution(&self, _: &dyn Shell) -> Vec<NetAttribution> {
+            vec![self.0.clone()]
+        }
+    }
+
+    #[test]
+    fn fanout_registers_every_inner_tap() {
+        // The density case the spec promises: N concurrent VMs, each with its own
+        // tap and ifindex, each registered with the owner and each carrying its
+        // own ULID. A single-valued SPI made this dead on arrival.
+        use crate::netattrib::{fake_owner, sock_path, AttributionSession, ControlClient, HandleTable};
+
+        let path = sock_path("fanout-attrib");
+        // add + state per VM, then remove per VM.
+        let owner = fake_owner(path.clone(), vec!["ok\n"; 6]);
+        let client =
+            ControlClient::connect(&path, std::time::Duration::from_secs(2)).expect("connect");
+        let mut session = AttributionSession { client, table: HandleTable::new() };
+
+        let na = |tap: &str, ifindex: u32, mac: &str| NetAttribution {
+            tap: tap.to_string(),
+            ifindex,
+            guest_mac: mac.to_string(),
+            netns_inum: 0,
+        };
+        let inners: Vec<Box<dyn Target>> = vec![
+            Box::new(TapStub(na("asyq-0", 11, "02:00:00:00:00:00"))),
+            Box::new(TapStub(na("asyq-1", 12, "02:00:00:00:00:01"))),
+        ];
+        let f = FanoutTarget::new(inners);
+
+        let sh = FakeShell::default();
+        // The SPI itself reports both, in inner order.
+        let reported = f.net_attribution(&sh);
+        assert_eq!(reported.len(), 2);
+        assert_eq!(reported[0].tap, "asyq-0");
+        assert_eq!(reported[1].tap, "asyq-1");
+
+        let runner = FakeRunner::default();
+        let workload =
+            CommandWorkload(CommandSet { commands: BTreeMap::new(), vars: BTreeMap::new() });
+        let art =
+            execute_run(&sh, &runner, &f, &workload, &[], Some(&mut session)).expect("run");
+
+        // Two handles registered, so two provenance rows with distinct taps and
+        // distinct ULIDs.
+        let prov = art.vm_attribution.expect("attribution was enabled");
+        let vms = prov["vms"].as_array().expect("vms is an array");
+        assert_eq!(vms.len(), 2);
+        assert_eq!(vms[0]["handle"], 0);
+        assert_eq!(vms[1]["handle"], 1);
+        assert_eq!(vms[0]["tap"], "asyq-0");
+        assert_eq!(vms[1]["tap"], "asyq-1");
+        assert_eq!(vms[0]["ifindex"], 11);
+        assert_eq!(vms[1]["ifindex"], 12);
+        assert_ne!(vms[0]["vm_id"], vms[1]["vm_id"], "each VM gets its own ULID");
+        assert!(prov.get("unresolved_handles").is_none());
+
+        // Both VMs were added, both moved to RUNNING, and both were removed.
+        let got = owner.join().expect("owner thread");
+        assert_eq!(
+            got,
+            vec![
+                "add 11 0 0",
+                "state 0 RUNNING",
+                "add 12 1 0",
+                "state 1 RUNNING",
+                "remove 0",
+                "remove 1",
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_run_errors_when_attribution_is_enabled_but_no_tap_was_set_up() {
+        // The message has to name both causes: a missing `network: tap` key, and
+        // a def that sets it but restores from a snapshot (tap setup is cold boot
+        // only), which would otherwise send the operator back to a key they
+        // already set.
+        use crate::netattrib::{fake_owner, sock_path, AttributionSession, ControlClient, HandleTable};
+
+        let path = sock_path("no-tap");
+        let owner = fake_owner(path.clone(), vec![]);
+        let client =
+            ControlClient::connect(&path, std::time::Duration::from_secs(2)).expect("connect");
+        let mut session = AttributionSession { client, table: HandleTable::new() };
+
+        let sh = FakeShell::default();
+        let runner = FakeRunner::default();
+        let target = CommandTarget(CommandSet { commands: BTreeMap::new(), vars: BTreeMap::new() });
+        let workload =
+            CommandWorkload(CommandSet { commands: BTreeMap::new(), vars: BTreeMap::new() });
+        let err = match execute_run(&sh, &runner, &target, &workload, &[], Some(&mut session)) {
+            Err(e) => e,
+            Ok(_) => panic!("no tap while attribution is on is a config error"),
+        };
+        assert!(err.contains("set up no tap"), "got: {err}");
+        assert!(err.contains("cold boot only"), "got: {err}");
+
+        let _ = owner.join();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
