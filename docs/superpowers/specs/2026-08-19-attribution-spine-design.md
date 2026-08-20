@@ -103,7 +103,7 @@ fn rewrite_vm_id_labels(fragments: &mut [Fragment], handle_to_ulid: &BTreeMap<u6
 
 A series whose `labels.vm_id` is a handle with no table entry is left as-is and flagged in `capture_meta` (a handle the orchestrator never issued means a stale map, worth surfacing).
 
-- The AssayRun records the full table as additive `capture_meta.vm_attribution`: an array of `{ handle, vm_id (ULID), tap, guest_mac, ifindex, netns_inum }`. This is the provenance that makes a dense-handle run self-describing after the fact.
+- The AssayRun records the full table as additive `capture_meta.vm_attribution`, an object: `{ "vms": [ { handle, vm_id (ULID), tap, guest_mac, ifindex, netns_inum }, ... ], "unresolved_handles": [ "<handle>", ... ] }`. The `vms` array is ascending by handle. `unresolved_handles` is present only when a series carried a handle the orchestrator never issued, so the stale-map signal travels with the provenance rather than needing a second field elsewhere. This is what makes a dense-handle run self-describing after the fact.
 
 Limits: the rewrite is string-keyed on the handle rendering, so the gadget and the orchestrator must agree on how a handle is rendered (decimal, no padding). That agreement is part of the ABI and is asserted by a round-trip test.
 
@@ -131,7 +131,7 @@ BTF/libbpf host (the gadget's own suite):
 ## Contract touchpoints
 
 Additive only, no schema change beyond sub-project 1:
-- `capture_meta.vm_attribution`: the handle to ULID/tap/mac provenance array (owner fragment and assembled run).
+- `capture_meta.vm_attribution`: the handle to ULID/tap/mac provenance object described above (owner fragment and assembled run). `capture_meta` is unconstrained by `contract/assay-run.schema.json`, so this needs no schema change.
 - Reuse of `labels.vm_id` from sub-project 1; the value is a handle in raw fragments and a ULID after the rewrite.
 
 ## Open decisions for review
@@ -140,3 +140,14 @@ Additive only, no schema change beyond sub-project 1:
 2. `guest_mac` derivation: a locally-administered MAC from the handle (`02:...`), so it is deterministic and collision-free per run. Confirm the prefix.
 3. Stale-pin policy: error on an existing pin (leaning this, surfaces a crashed prior run) vs reclaim it. A reclaim hides a real problem, so the default is to error and let the operator clear it.
 4. Whether `net_attribution()` returning `Some` should also imply the run driver requires a merged `netattrib` owner (i.e. tap networking without the owner running is a config error, not a silent no-op). Leaning yes: if a VM has a tap for attribution, not running the owner is almost certainly a mistake.
+
+## Implementation notes (as built)
+
+Recorded here where they supersede the text above, so a later reader is not sent after something the code does differently on purpose.
+
+1. The tap `ifindex` is read from `/sys/class/net/<tap>/ifindex` through the adapter's shell seam, not via an in-process rtnetlink `RTM_GETLINK`. The whole adapter is shell-based and tested through a fake `Shell`, so a netlink socket would be the one thing in it that no test could drive.
+2. `guest_mac` derives from the per-instance index, not from the handle. The MAC has to be configured during `provision`, and the handle does not exist until the VM is registered after steady, so the handle is genuinely unavailable at that point. The index is what makes the address unique across concurrent instances on a host, which is what the handle was there for.
+3. `Target::net_attribution` returns a `Vec<NetAttribution>` (empty for no tap), not an `Option`. A `FanoutTarget` reports one row per inner instance, in inner order, and the run driver registers every one of them. The provenance was always a table, so a single-valued SPI could not carry the density the design asks for.
+4. `capture_meta.vm_attribution` is the object shape above rather than a bare array, because it also carries `unresolved_handles`.
+5. The provenance is plumbed as `RunArtifacts.vm_attribution` but is not yet attached to an assembled run: both `execute_run` call sites pass `None` for the session, so nothing builds one until the next sub-project wires the pause/resume hook and the assemble step.
+6. Tap setup is cold boot only. The tap block sits after `/drives/rootfs` in `provision`, and restore mode returns before it, so `network: tap` on a snapshot def has no effect. Documented in the `network` row of `docs/config-reference.md` and named in the run driver's error.
