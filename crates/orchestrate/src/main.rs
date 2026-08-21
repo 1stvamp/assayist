@@ -21,6 +21,7 @@ mod def;
 mod gate;
 mod hostprep;
 mod native;
+mod netattrib;
 mod run;
 
 use std::collections::BTreeMap;
@@ -704,7 +705,9 @@ fn run_cmd(args: &[String]) -> ExitCode {
                     }
                 };
 
-                let art = match adapter::execute_run(&shell, &runner, target.as_ref(), workload.as_ref(), &plan) {
+                // Attribution is wired in with the pause/resume hook (sub-project 3),
+                // which is what makes the lifecycle states worth driving.
+                let art = match adapter::execute_run(&shell, &runner, target.as_ref(), workload.as_ref(), &plan, None) {
                     Ok(a) => a,
                     Err(e) => {
                         eprintln!("run {group}[cell {ci} #{i}] failed: {e}");

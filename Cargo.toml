@@ -22,6 +22,7 @@ exclude = [
     "capture/net",
     "capture/ctrlplane",
     "capture/resident",
+    "capture/netattrib",
 ]
 
 # Shared package metadata, inherited by each crate with `<field>.workspace = true`
